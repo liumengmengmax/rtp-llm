@@ -639,9 +639,15 @@ void CudaGraphRunner::initCapture() {
         // get real output data type (params already prepared in attn impl __init__/create_params)
         auto attn_pyobj = py_attn_pyobj_method_(capture_mem_hold_.py_model_inputs_, true);
         RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
-        py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+        auto init_outputs_obj = py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+        auto init_outputs     = init_outputs_obj.cast<PyModelOutputs>();
         RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
-        output = torch::zeros({max_num_token_, hidden_size_}, options_cuda_float_);
+        // Use actual model output dimension (may differ from hidden_size_ for models with final projection)
+        output_hidden_size_ = init_outputs.hidden_states.size(-1);
+        auto output_dtype   = init_outputs.hidden_states.options();
+        RTP_LLM_LOG_INFO(
+            "initCapture: model hidden_size=%d, actual output_hidden_size=%d", hidden_size_, output_hidden_size_);
+        output = torch::zeros({max_num_token_, output_hidden_size_}, output_dtype);
         capture_mem_hold_.setHiddenStates(output);
         initCaptureAttentionInputsPost();
         logCudaGraphPoolMemory("before_capture");

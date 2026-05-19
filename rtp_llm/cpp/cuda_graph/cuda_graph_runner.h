@@ -133,10 +133,12 @@ private:
     int                     seq_size_per_block_{0};
     int                     kernel_seq_size_per_block_{0};
     int                     hidden_size_{0};
-    int                     sp_steps_{0};
-    std::vector<int>        capture_range_;
-    std::vector<int>        prefill_capture_seq_lens_;    // Pre-configured sequence lengths from Python
-    std::vector<int>        decode_capture_batch_sizes_;  // Pre-configured batch sizes from Python
+    int                     output_hidden_size_{
+        0};  // Actual model output dimension (may differ from hidden_size_ for embedding models with MLP projection)
+    int              sp_steps_{0};
+    std::vector<int> capture_range_;
+    std::vector<int> prefill_capture_seq_lens_;    // Pre-configured sequence lengths from Python
+    std::vector<int> decode_capture_batch_sizes_;  // Pre-configured batch sizes from Python
     // capture seqLen -> GraphInstance (prefill)
     // batch_size -> GraphInstance (decode)
     std::unordered_map<int, GraphInstance> graph_instances_;
