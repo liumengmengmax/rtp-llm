@@ -59,6 +59,7 @@ private:
     ModelConfig                         model_config_;
     ParallelismConfig                   parallelism_config;
     ConcurrencyConfig                   concurrency_config;
+    ProfilingDebugLoggingConfig         profiling_debug_logging_config_;
     std::thread                         loop_thread_;
     std::atomic<bool>                   running_{false};
     std::unique_ptr<EmbeddingExecutor>  executor_;

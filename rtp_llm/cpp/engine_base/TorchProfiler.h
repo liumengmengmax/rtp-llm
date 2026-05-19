@@ -32,10 +32,21 @@ public:
     TorchProfile& operator=(const TorchProfile&) = delete;
 
 private:
-    std::string                 prefix_;
-    std::string                 output_dir_;
-    static std::atomic<size_t>  count_;
-    tpi::ProfilerConfig         config_ = tpi::ProfilerConfig(tpi::ProfilerState::KINETO, /*report_input_shapes=*/true);
+    std::string                prefix_;
+    std::string                output_dir_;
+    static std::atomic<size_t> count_;
+    // with_stack=true: capture Python call stack (file:line + function) per CPU op,
+    //                  so Perfetto shows the originating .py source instead of just `aten::div`.
+    // with_modules=true: prepend nn.Module hierarchy (e.g. `MultiHeadAttention.forward / Linear.forward`)
+    //                    to op names. Note: enabling with_stack also captures background-thread Python
+    //                    frames (threading._bootstrap, spawn_main, ...). Filter to the main inference
+    //                    thread in Perfetto to ignore that noise.
+    tpi::ProfilerConfig         config_ = tpi::ProfilerConfig(tpi::ProfilerState::KINETO,
+                                                      /*report_input_shapes=*/true,
+                                                      /*profile_memory=*/false,
+                                                      /*with_stack=*/true,
+                                                      /*with_flops=*/false,
+                                                      /*with_modules=*/true);
     std::set<tpi::ActivityType> activities_{tpi::ActivityType::CPU, tpi::ActivityType::CUDA};
     bool                        stopped_ = true;
 };

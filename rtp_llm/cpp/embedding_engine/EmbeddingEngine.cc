@@ -4,8 +4,11 @@
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "autil/EnvUtil.h"
 #include <c10/core/InferenceMode.h>
+#include <algorithm>
 #include <exception>
+#include <string>
 
 using namespace std;
 namespace rtp_llm {
@@ -14,6 +17,7 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
     concurrency_config(params.concurrency_config),
+    profiling_debug_logging_config_(params.profiling_debug_logging_config),
     metrics_reporter_(params.metrics_reporter),
     step_profiler_(params.profiling_debug_logging_config.torch_cuda_profiler_dir,
                    params.parallelism_config.dp_rank * params.parallelism_config.tp_size
@@ -103,7 +107,41 @@ absl::Status EmbeddingEngine::step() {
         RTP_LLM_LOG_INFO("no query run and sleep");
         return absl::OkStatus();
     }
-    step_profiler_.tick();
+    // If gen_timeline_sync is enabled and no profiling session is currently active,
+    // configure + tick BEFORE process() to start the profiler before the actual work runs.
+    // After process(), tick() again to count this step. When the step count reaches num_steps,
+    // the profiler auto-stops and saves the JSON file. The next step() will start a new window.
+    //
+    // Window parameters mirror the NormalEngine (LLM) control surface, but since
+    // EmbeddingEngine has no per-stream `generateConfig` to source them from, we expose them
+    // as environment variables (sharing the GEN_TIMELINE_* prefix with the existing SYNC flag):
+    //
+    //   GEN_TIMELINE_SYNC        -> ProfilingDebugLoggingConfig.gen_timeline_sync (master switch)
+    //   GEN_TIMELINE_TRACE_NAME  -> trace prefix for the JSON filename (default: embedding_timeline)
+    //   GEN_TIMELINE_START_STEP  -> warm-up steps to skip before starting the profiler  (default: 0)
+    //   GEN_TIMELINE_NUM_STEPS   -> how many steps to capture before stop+flush          (default: 1)
+    //
+    // For embedding models each step() runs one complete forward pass (unlike NormalEngine
+    // where a single request spans many decode steps). One step is usually sufficient to
+    // capture a representative trace, so num_steps defaults to 1 to ensure the JSON is
+    // flushed even if the server is torn down right after a single query (e.g. on a
+    // smoke-test failure path).
+    if (profiling_debug_logging_config_.gen_timeline_sync && !step_profiler_.enabled()) {
+        // Read profiling window parameters via the project-standard EnvUtil helper
+        // (same pattern as PERF_TEST in GenerateStream.cc, BIZ_NAME / CHECKPOINT_PATH in
+        // RemoteConnector.cc, FT_SERVER_TEST in Logger.cc, etc.). The template overload
+        // dispatches on the default-value type: std::string / int / bool.
+        const std::string trace_name =
+            autil::EnvUtil::getEnv("GEN_TIMELINE_TRACE_NAME", std::string("embedding_timeline"));
+        const int start_step = std::max(0, autil::EnvUtil::getEnv("GEN_TIMELINE_START_STEP", 0));
+        const int num_steps  = std::max(1, autil::EnvUtil::getEnv("GEN_TIMELINE_NUM_STEPS", 1));
+        RTP_LLM_LOG_INFO("EmbeddingEngine timeline profiling configured: trace=%s start_step=%d num_steps=%d",
+                         trace_name.c_str(),
+                         start_step,
+                         num_steps);
+        step_profiler_.configure(true, trace_name, start_step, num_steps);
+        step_profiler_.tick();  // tick once now so start_step counting begins immediately
+    }
     try {
         auto status = executor_->process(streams);
         if (!status.ok()) {
@@ -125,6 +163,8 @@ absl::Status EmbeddingEngine::step() {
             abort();
         }
     }
+    // tick profiler after process() to count this step (and stop when num_steps reached).
+    step_profiler_.tick();
     cudaSyncAndCheck();
     return absl::OkStatus();
 }
