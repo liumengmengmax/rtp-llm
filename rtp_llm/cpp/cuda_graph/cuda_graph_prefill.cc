@@ -19,37 +19,10 @@ void CudaGraphRunner::capturePrefill() {
         prepareCaptureInputs(inputs, max_bs_, seq_len);
         // Prefill-specific settings, one the first seq is valid, the post ones are all empty
         if (is_prefill_cuda_graph_mode_ && num_tokens_per_bs_ == max_seq_len_) {
-            // Embedding model prefill (no kv cache).
-            //
-            // Production prefill batches are multi-seq (each request is one seq, dozens of
-            // requests batched together) — exactly the pattern non-embedding prefill (line
-            // 47-58) already handles. We mirror that pattern here so the captured graph
-            // can cover capture seq_len up to max_bs_ * max_seq_len_, instead of being
-            // capped at max_seq_len_ by a single-seq RoPE position bound.
-            //
-            // Slice seq_len into ceil(seq_len / max_seq_len_) active batch slots; each
-            // slot holds at most max_seq_len_ tokens so RoPE positions never exceed
-            // max_position_embeddings. cu_seqlens / cu_kv_seqlens are full prefix sums
-            // across [0, max_bs_+1) (kv == seqlens because there is no kv-cache prefix).
-            int active_bs = (seq_len + max_seq_len_ - 1) / max_seq_len_;
-            inputs.attention_inputs.prefix_lengths.fill_(0);
-            inputs.attention_inputs.input_lengths.fill_(0);
-            for (int b = 0; b < active_bs; ++b) {
-                int tokens = (b < active_bs - 1) ? max_seq_len_ : (seq_len - b * max_seq_len_);
-                inputs.attention_inputs.input_lengths[b] = tokens;
-            }
-
-            auto cu_seqlens_host    = inputs.attention_inputs.cu_seqlens_host;
-            auto cu_kv_seqlens_host = inputs.attention_inputs.cu_kv_seqlens.cpu();
-            cu_seqlens_host[0]      = 0;
-            cu_kv_seqlens_host[0]   = 0;
-            for (int b = 0; b < max_bs_; ++b) {
-                int tok                   = inputs.attention_inputs.input_lengths[b].item<int>();
-                cu_seqlens_host[b + 1]    = cu_seqlens_host[b].item<int>() + tok;
-                cu_kv_seqlens_host[b + 1] = cu_kv_seqlens_host[b].item<int>() + tok;
-            }
-            inputs.attention_inputs.cu_seqlens.copy_(cu_seqlens_host);
-            inputs.attention_inputs.cu_kv_seqlens.copy_(cu_kv_seqlens_host);
+            // Embedding model prefill is already packed as one compact token vector.
+            // Capture only a compact token bucket of seq_len tokens and keep the true
+            // sequence boundaries in cu_seqlens; do not expand to max_bs * max_seq_len.
+            prepareCompactEmbeddingPrefillLengths(inputs, seq_len);
         } else {
             // Draft model prefill: distribute seq_len tokens across batches (max num_tokens_per_bs_ each).
             // All max_bs_ batches get prefix to ensure buffer allocation covers worst-case replay.

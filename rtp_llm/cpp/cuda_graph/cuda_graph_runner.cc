@@ -45,6 +45,55 @@ void optimizedCopyAsync(const torch::Tensor& src, torch::Tensor& dst, size_t siz
     }
 }
 
+bool CudaGraphRunner::isCompactEmbeddingPrefillGraph() const {
+    return is_prefill_cuda_graph_mode_ && num_tokens_per_bs_ == max_seq_len_;
+}
+
+void CudaGraphRunner::prepareCompactEmbeddingPrefillLengths(PyModelInputs& inputs, int seq_len) const {
+    RTP_LLM_CHECK_WITH_INFO(seq_len > 0, "compact embedding prefill capture seq_len must be positive");
+
+    auto& attention_inputs = inputs.attention_inputs;
+    attention_inputs.prefix_lengths.fill_(0);
+    attention_inputs.input_lengths.fill_(0);
+    if (attention_inputs.prefix_lengths_d.defined() && attention_inputs.prefix_lengths_d.numel() > 0) {
+        attention_inputs.prefix_lengths_d.fill_(0);
+    }
+
+    // Keep the Q/K/V storage compact: sum(input_lengths) == seq_len.  At the same
+    // time, make as many batch slots non-empty as the token budget allows so graph
+    // capture covers multi-seq replay grids without expanding to max_bs * max_seq_len.
+    const int active_bs = std::min<int>(static_cast<int>(max_bs_), seq_len);
+    int       remaining = seq_len;
+    for (int b = 0; b < active_bs; ++b) {
+        const int slots_left              = active_bs - b - 1;
+        const int tokens                  = std::min(max_seq_len_, remaining - slots_left);
+        attention_inputs.input_lengths[b] = tokens;
+        remaining -= tokens;
+    }
+    RTP_LLM_CHECK_WITH_INFO(remaining == 0, "compact embedding prefill length packing failed, remaining=%d", remaining);
+
+    if (attention_inputs.input_lengths_d.defined() && attention_inputs.input_lengths_d.numel() > 0) {
+        attention_inputs.input_lengths_d.copy_(attention_inputs.input_lengths);
+    }
+    if (attention_inputs.sequence_lengths.defined() && attention_inputs.sequence_lengths.numel() > 0) {
+        attention_inputs.sequence_lengths.copy_(attention_inputs.input_lengths);
+    }
+
+    auto cu_seqlens_host = attention_inputs.cu_seqlens_host;
+    int  prefix_sum      = 0;
+    cu_seqlens_host[0]   = 0;
+    for (int b = 0; b < static_cast<int>(max_bs_); ++b) {
+        prefix_sum += attention_inputs.input_lengths[b].item<int>();
+        cu_seqlens_host[b + 1] = prefix_sum;
+    }
+    RTP_LLM_CHECK_WITH_INFO(prefix_sum == seq_len,
+                            "compact embedding prefill cu_seqlens mismatch, prefix_sum=%d, seq_len=%d",
+                            prefix_sum,
+                            seq_len);
+    attention_inputs.cu_seqlens.copy_(cu_seqlens_host);
+    attention_inputs.cu_kv_seqlens.copy_(attention_inputs.cu_seqlens);
+}
+
 void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs");
     // 1. non spec cuda graph:
@@ -252,6 +301,8 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
         if (state.current_batch_size < max_bs_) {
             py_model_inputs_.attention_inputs.prefix_lengths.slice(0, state.current_batch_size, max_bs_).fill_(0);
             py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, max_bs_).fill_(0);
+            py_model_inputs_.attention_inputs.prefix_lengths_d.slice(0, state.current_batch_size, max_bs_).fill_(0);
+            py_model_inputs_.attention_inputs.input_lengths_d.slice(0, state.current_batch_size, max_bs_).fill_(0);
         }
 
         int last_valid = state.current_seq_len;
@@ -484,7 +535,7 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.padding_offset            = torch::zeros({int(max_seq_len_ * max_bs_)}, options_cpu_int32_);
     inputs.attention_inputs.padding_offset            = inputs.attention_inputs.padding_offset.pin_memory();
     inputs.attention_inputs.dtype                     = model_data_type_;
-    inputs.attention_inputs.is_s_padded               = true;
+    inputs.attention_inputs.is_s_padded               = !isCompactEmbeddingPrefillGraph();
     inputs.attention_inputs.sequence_lengths_plus_1_d = torch::zeros({int(max_bs_)}, options_cuda_int32_);
     inputs.attention_inputs.decode_cu_seqlens_d =
         torch::arange(0, max_bs_ + 1, 1, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
@@ -499,7 +550,9 @@ void CudaGraphRunner::initCaptureAttentionInputsPost() {
                             "capture_mem_hold_ cuda_graph_prefill_batch_size is not pinned memory");
 
     // draft model prefill but not embedding model
-    if (num_tokens_per_bs_ > 1 && num_tokens_per_bs_ != max_seq_len_) {
+    if (isCompactEmbeddingPrefillGraph()) {
+        inputs.attention_inputs.prefill_cuda_graph_copy_params.reset();
+    } else if (num_tokens_per_bs_ > 1 && num_tokens_per_bs_ != max_seq_len_) {
         inputs.attention_inputs.prefill_cuda_graph_copy_params =
             PyPrefillCudaGaphCopyParams{cuda_graph_prefill_batch_size, num_tokens_per_bs_, int(max_bs_)};
     } else {
@@ -605,23 +658,27 @@ void CudaGraphRunner::initCapture() {
 
         if (is_prefill_cuda_graph_mode_) {
             RTP_LLM_LOG_INFO("initCapture forward post check start for prefill");
-            // Multi-seq batch pattern: max_num_token_ = max_bs_ * num_tokens_per_bs_ tokens
-            // are split across max_bs_ slots, each holding num_tokens_per_bs_ (<= max_seq_len_)
-            // tokens. This keeps RoPE positions within max_position_embeddings even when
-            // max_num_token_ exceeds max_seq_len_, matching how production prefill batches
-            // multiple requests together.
-            for (int b = 0; b < max_bs_; ++b) {
-                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths[b]   = num_tokens_per_bs_;
-                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths_d[b] = num_tokens_per_bs_;
-            }
-            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[0] = 0;
-            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[0]      = 0;
-            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[0]   = 0;
-            for (int b = 0; b < max_bs_; ++b) {
-                int prefix_sum = (b + 1) * num_tokens_per_bs_;
-                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[b + 1] = prefix_sum;
-                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[b + 1]      = prefix_sum;
-                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[b + 1]   = prefix_sum;
+            if (isCompactEmbeddingPrefillGraph()) {
+                prepareCompactEmbeddingPrefillLengths(capture_mem_hold_.py_model_inputs_, max_num_token_);
+            } else {
+                // Multi-seq batch pattern: max_num_token_ = max_bs_ * num_tokens_per_bs_ tokens
+                // are split across max_bs_ slots, each holding num_tokens_per_bs_ (<= max_seq_len_)
+                // tokens. This keeps RoPE positions within max_position_embeddings even when
+                // max_num_token_ exceeds max_seq_len_, matching how production prefill batches
+                // multiple requests together.
+                for (int b = 0; b < max_bs_; ++b) {
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths[b]   = num_tokens_per_bs_;
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths_d[b] = num_tokens_per_bs_;
+                }
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[0] = 0;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[0]      = 0;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[0]   = 0;
+                for (int b = 0; b < max_bs_; ++b) {
+                    int prefix_sum = (b + 1) * num_tokens_per_bs_;
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[b + 1] = prefix_sum;
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[b + 1]      = prefix_sum;
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[b + 1]   = prefix_sum;
+                }
             }
 
             PyModelInputs inputs = capture_mem_hold_.py_model_inputs_;
@@ -801,7 +858,7 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
     inputs.attention_inputs.kv_cache_layer_to_group =
         capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_layer_to_group;
     inputs.bert_embedding_inputs        = capture_mem_hold_.py_model_inputs_.bert_embedding_inputs;
-    inputs.attention_inputs.is_s_padded = true;
+    inputs.attention_inputs.is_s_padded = !isCompactEmbeddingPrefillGraph();
 }
 
 CaptureMemoryHold CudaGraphRunner::createCaptureMemoryHold(PyModelInputs& inputs, int tokens_count) {
