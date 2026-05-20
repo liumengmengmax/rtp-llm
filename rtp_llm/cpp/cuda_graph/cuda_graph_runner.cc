@@ -655,6 +655,44 @@ void CudaGraphRunner::initCapture() {
         if (is_prefill_cuda_graph_mode_) {
             RTP_LLM_CHECK_WITH_INFO(isEmbeddingStylePrefillCudaGraph() || isMtpDraftPrefillCudaGraph(),
                                     "prefill cuda graph: expected embedding-style or MTP draft layout");
+            RTP_LLM_LOG_INFO("initCapture forward post check start for prefill");
+            // Multi-seq batch pattern: max_num_token_ = max_bs_ * num_tokens_per_bs_ tokens
+            // are split across max_bs_ slots, each holding num_tokens_per_bs_ (<= max_seq_len_)
+            // tokens. This keeps RoPE positions within max_position_embeddings even when
+            // max_num_token_ exceeds max_seq_len_, matching how production prefill batches
+            // multiple requests together.
+            for (int b = 0; b < max_bs_; ++b) {
+                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths[b]   = num_tokens_per_bs_;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths_d[b] = num_tokens_per_bs_;
+            }
+            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[0] = 0;
+            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[0]      = 0;
+            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[0]   = 0;
+            for (int b = 0; b < max_bs_; ++b) {
+                int prefix_sum = (b + 1) * num_tokens_per_bs_;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host[b + 1] = prefix_sum;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens[b + 1]      = prefix_sum;
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens[b + 1]   = prefix_sum;
+            }
+
+            PyModelInputs inputs = capture_mem_hold_.py_model_inputs_;
+            inputs.attention_inputs.cu_seqlens_host =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens_host.slice(0, 0, max_bs_ + 1);
+            inputs.attention_inputs.cu_seqlens =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens.slice(0, 0, max_bs_ + 1);
+            inputs.attention_inputs.cu_kv_seqlens =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens.slice(0, 0, max_bs_ + 1);
+            inputs.attention_inputs.input_lengths =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths.slice(0, 0, max_bs_);
+            inputs.attention_inputs.input_lengths_d =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths_d.slice(0, 0, max_bs_);
+            inputs.attention_inputs.kv_cache_kernel_block_id_device =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.slice(
+                    0, 0, max_bs_);
+            inputs.attention_inputs.kv_cache_kernel_block_id_host =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host.slice(0, 0, max_bs_);
+            py_forward_method_(inputs);
+            RTP_LLM_LOG_INFO("initCapture forward post check end for prefill");
             capturePrefill();
         } else {
             captureDecode();
