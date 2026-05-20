@@ -105,6 +105,8 @@ private:
     CaptureMemoryHold createCaptureMemoryHold(PyModelInputs& inputs, int tokens_count);
     void              initKernelInternalMemory();
     void              logCudaGraphPoolMemory(const char* phase);
+    bool              isCompactEmbeddingPrefillGraph() const;
+    void              prepareCompactEmbeddingPrefillLengths(PyModelInputs& inputs, int seq_len) const;
     void              setPositionEncoding(torch::Tensor position_encoding) override;
     void              setTokenTypeEmbedding(torch::Tensor token_type_embedding) override;
     void              setInputEmbeddingScalar(float input_embedding_scalar) override;
