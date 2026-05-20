@@ -20,14 +20,28 @@ void CudaGraphRunner::capturePrefill() {
         prepareCaptureInputs(inputs, max_bs_, seq_len);
         // Prefill-specific settings, one the first seq is valid, the post ones are all empty
         if (isEmbeddingStylePrefillCudaGraph()) {
-            // embedding model, without kv cache
+            // Embedding model (no kv cache): batch index 0 holds the only active seq of
+            // length seq_len, the remaining max_bs_-1 entries are 0-length padding.
+            // cu_seqlens / cu_kv_seqlens MUST be filled across the full [0, max_bs_+1)
+            // range so the prefix-sum stays monotonically non-decreasing; otherwise
+            // FlashInfer plan reads stale tail entries and the captured graph hits
+            // illegal memory access during replay (only seq_len == max_seq_len_ used to
+            // work because initCapture's post-check happened to leave a compatible state).
             inputs.attention_inputs.prefix_lengths.fill_(0);
-            // Must set cu_seqlens/cu_kv_seqlens/input_lengths to match actual seq_len,
-            // otherwise FlashInfer plans for max_seq_len tokens but q/k/v only have seq_len tokens
-            inputs.attention_inputs.cu_seqlens_host[0] = 0;
-            inputs.attention_inputs.cu_seqlens_host[1] = seq_len;
-            inputs.attention_inputs.cu_seqlens.copy_(inputs.attention_inputs.cu_seqlens_host, false);
+            inputs.attention_inputs.input_lengths.fill_(0);
             inputs.attention_inputs.input_lengths[0] = seq_len;
+
+            auto cu_seqlens_host    = inputs.attention_inputs.cu_seqlens_host;
+            auto cu_kv_seqlens_host = inputs.attention_inputs.cu_kv_seqlens.cpu();
+            cu_seqlens_host[0]      = 0;
+            cu_kv_seqlens_host[0]   = 0;
+            for (int b = 0; b < max_bs_; ++b) {
+                int tok                   = (b == 0) ? seq_len : 0;
+                cu_seqlens_host[b + 1]    = cu_seqlens_host[b].item<int>() + tok;
+                cu_kv_seqlens_host[b + 1] = cu_kv_seqlens_host[b].item<int>() + tok;
+            }
+            inputs.attention_inputs.cu_seqlens.copy_(cu_seqlens_host);
+            inputs.attention_inputs.cu_kv_seqlens.copy_(cu_kv_seqlens_host);
         } else {
             // Draft model prefill: distribute seq_len tokens across batches (max num_tokens_per_bs_ each).
             // All max_bs_ batches get prefix to ensure buffer allocation covers worst-case replay.
