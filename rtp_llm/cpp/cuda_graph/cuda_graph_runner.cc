@@ -167,8 +167,12 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
         }
     };
 
-    // clear kv_cache_kernel_block_id_device, otherwise it will cause the cache block pollution
-    py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.fill_(0);
+    // clear kv_cache_kernel_block_id_device, otherwise it will cause the cache block pollution.
+    // Embedding prefill (is_prefill_cuda_graph_mode_) has no KV cache, so the buffer is unused
+    // and the GPU fill_(0) kernel launch is pure overhead per replay.
+    if (!is_prefill_cuda_graph_mode_) {
+        py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.fill_(0);
+    }
 
     // NOTE: kv_cache_block_id_{host,device} are physical block IDs dedicated for cache store
     // (see OpDefs.h). They are NOT consumed by any GPU attention kernel during CUDA graph replay;
@@ -375,7 +379,17 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
 }
 
 bool CudaGraphRunner::tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, CudaGraphState& state) {
-    state.current_seq_len = inputs.attention_inputs.input_lengths.sum(0).item<int>();
+    // input_lengths is a CPU pinned int32 tensor (see EmbeddingExecutor.cc i32_options
+    // + pin_memory(); see also initCapture). Going through the PyTorch dispatcher with
+    // .sum(0).item<int>() costs ~50-100us due to op-dispatch + tensor allocation overhead;
+    // direct pointer access is sub-microsecond and avoids the temporary scalar tensor.
+    const int64_t bs       = inputs.attention_inputs.input_lengths.size(0);
+    const int*    lens_ptr = inputs.attention_inputs.input_lengths.data_ptr<int>();
+    int           sum      = 0;
+    for (int64_t i = 0; i < bs; ++i) {
+        sum += lens_ptr[i];
+    }
+    state.current_seq_len = sum;
     if (capture_range_.empty()) {
         RTP_LLM_LOG_WARNING("prefill cuda graph: capture_range_ is empty, cannot run");
         return false;
@@ -414,7 +428,14 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
         "batch size used in replay: %d (graph key %d)", state.current_batch_size, state.current_real_graph_bs);
 
     if (inputs.attention_inputs.is_prefill) {
-        state.seq_len_sum = inputs.attention_inputs.input_lengths.sum(0).item<int>();
+        // Same CPU-pinned-tensor sum optimization as in tryGetRealGraphPrefillSeqLen above.
+        const int64_t bs       = inputs.attention_inputs.input_lengths.size(0);
+        const int*    lens_ptr = inputs.attention_inputs.input_lengths.data_ptr<int>();
+        int           sum      = 0;
+        for (int64_t i = 0; i < bs; ++i) {
+            sum += lens_ptr[i];
+        }
+        state.seq_len_sum = sum;
     } else {
         state.seq_len_sum = cuda_graph_bs;
     }
