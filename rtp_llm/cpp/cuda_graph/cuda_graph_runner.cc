@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <c10/core/InferenceMode.h>
+#include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
@@ -400,6 +401,28 @@ bool CudaGraphRunner::tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, 
         RTP_LLM_LOG_WARNING("prefill seq_len %d exceeds max captured %d, fallback to normal run",
                             state.current_seq_len,
                             capture_range_.back());
+        return false;
+    }
+    // Padding cost gate: when the captured graph's seq_len is much larger than the
+    // request's actual sum, replay does padding compute (the kernel runs on
+    // [capture_seq_len, hidden] regardless of actual data) — this padding is pure
+    // wasted FLOPS. cuda graph only saves CPU/launch overhead (~few ms per forward
+    // for embedding scale); if padding waste > those savings, eager mode is faster.
+    //
+    // Threshold (env CUDA_GRAPH_REPLAY_PADDING_THRESHOLD_PCT, default 20 means 20%):
+    // skip replay and fallback to eager when (capture_seq_len - actual) / actual > threshold/100.
+    // The "right" threshold is workload-specific (depends on per-fwd GPU time vs
+    // eager dispatch overhead) — measured from prod traffic, tune via env.
+    const int padding_threshold_pct =
+        std::max(0, autil::EnvUtil::getEnv("CUDA_GRAPH_REPLAY_PADDING_THRESHOLD_PCT", 20));
+    const int padding_tokens = static_cast<int>(*it) - state.current_seq_len;
+    if (state.current_seq_len > 0 && padding_tokens * 100 > state.current_seq_len * padding_threshold_pct) {
+        RTP_LLM_LOG_DEBUG("prefill seq_len %d vs capture %d: padding %d (%d%%) > threshold %d%%, fallback to eager",
+                          state.current_seq_len,
+                          *it,
+                          padding_tokens,
+                          padding_tokens * 100 / state.current_seq_len,
+                          padding_threshold_pct);
         return false;
     }
     state.current_real_graph_seq_len = *it;
