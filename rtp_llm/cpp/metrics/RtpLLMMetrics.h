@@ -226,6 +226,7 @@ public:
     int64_t total_latency_us   = 0;
     int64_t wait_latency_us    = 0;
     int64_t input_token_length = 0;
+    int64_t reuse_length       = 0;
 };
 
 class RtpEmbeddingStreamMetrics: public kmonitor::MetricsGroup {
@@ -237,6 +238,7 @@ public:
     kmonitor::MutableMetric* total_latency_us_metric   = nullptr;
     kmonitor::MutableMetric* wait_latency_us_metric    = nullptr;
     kmonitor::MutableMetric* input_token_length_metric = nullptr;
+    kmonitor::MutableMetric* reuse_length_metric       = nullptr;
 
 private:
     AUTIL_LOG_DECLARE();

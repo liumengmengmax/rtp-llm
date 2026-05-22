@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <bitset>
+#include <list>
+#include <vector>
 #include <torch/python.h>
 #include <torch/torch.h>
 #include <torch/extension.h>
@@ -9,6 +11,7 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingStream.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
+#include "rtp_llm/cpp/engine_base/stream/ResourceContext.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/embedding_engine/ModelRequest.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
@@ -35,7 +38,11 @@ using Flag = std::bitset<NUM_INPUT_TYPES>;
 
 class EmbeddingExecutor {
 public:
-    explicit EmbeddingExecutor(const EngineInitParams& params, py::object handler);
+    explicit EmbeddingExecutor(const EngineInitParams& params,
+                               py::object              handler,
+                               const ResourceContext&  resource_context,
+                               int32_t                 kv_cache_group_num,
+                               std::vector<int>        kv_cache_layer_to_group);
 
     absl::Status process(const std::list<EmbeddingStreamPtr>& streams);
 
@@ -49,6 +56,9 @@ private:
     ModelConfig                  model_config_;
     ParallelismConfig            parallelism_config;
     EPLBConfig                   eplb_config;
+    ResourceContext              resource_context_;
+    int32_t                      kv_cache_group_num_ = 1;
+    std::vector<int>             kv_cache_layer_to_group_;
 
     ModelRequest                     generateOldModelRequest(GptModelInputs& model_input);
     absl::StatusOr<GptModelInputs>   gatherModelInput(const std::list<EmbeddingStreamPtr>& streams) const;
@@ -62,6 +72,14 @@ private:
     slicePyList(py::object gpu_outputs, const std::list<EmbeddingStreamPtr>& streams, int total_batch_size) const;
     absl::StatusOr<py::object> postProcess(const ModelRequest& model_request, const GptModelOutputs& gpu_outputs);
     void calcTokenNum(const std::list<EmbeddingStreamPtr>& streams, int64_t& token_num, int64_t& batch_size) const;
+    absl::Status initKVCache(const std::list<EmbeddingStreamPtr>& streams) const;
+    size_t       maxKVCacheBlocks(const std::list<EmbeddingStreamPtr>& streams) const;
+    void         fillKVCacheMetadata(GptModelInputs& model_input) const;
+    void         copyKVCacheBlocks(GptModelInputs&             model_input,
+                                   const BatchKVCacheResource& kv_cache,
+                                   int                         model_batch_idx,
+                                   size_t                      max_blocks_num,
+                                   size_t                      kernel_blocks_per_kv_block) const;
     void init_position_ids(int max_seq_len);
     void reportMetrics(size_t context_batch_size, size_t combo_token_num, size_t max_seq_len) const;
 };

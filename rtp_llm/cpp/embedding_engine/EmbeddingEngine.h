@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 #include "absl/status/status.h"
 #include "rtp_llm/cpp/embedding_engine/EmbeddingExecutor.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
@@ -54,6 +55,7 @@ public:
 private:
     absl::Status trySaveStepError() const;
     void         loop();
+    void         initCacheManager(const EngineInitParams& params);
 
 private:
     ModelConfig                         model_config_;
@@ -67,6 +69,8 @@ private:
     ResourceContext                     resource_context_;
     kmonitor::MetricsReporterPtr        metrics_reporter_ = nullptr;
     StepWindowProfiler                  step_profiler_;
+    int32_t                             kv_cache_group_num_ = 1;
+    std::vector<int>                    kv_cache_layer_to_group_;
 };
 
 }  // namespace rtp_llm
