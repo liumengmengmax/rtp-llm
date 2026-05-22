@@ -2,16 +2,19 @@
 #include "c10/core/ScalarType.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/embedding_engine/EmbeddingExecutor.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 #include <ATen/TensorIndexing.h>
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <algorithm>
+#include <cstring>
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 using namespace std;
 using namespace at::indexing;
@@ -50,17 +53,28 @@ static bool has_arg(const Flag& flag, Arg idx) {
 
 }  // namespace HandlerArgs
 
-EmbeddingExecutor::EmbeddingExecutor(const EngineInitParams& params, py::object handler):
+EmbeddingExecutor::EmbeddingExecutor(const EngineInitParams& params,
+                                     py::object              handler,
+                                     const ResourceContext&  resource_context,
+                                     int32_t                 kv_cache_group_num,
+                                     std::vector<int>        kv_cache_layer_to_group):
     handler_(handler),
     handler_args_(),
     metrics_reporter_(params.metrics_reporter),
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
-    eplb_config(params.eplb_config) {
+    eplb_config(params.eplb_config),
+    resource_context_(resource_context),
+    kv_cache_group_num_(kv_cache_group_num),
+    kv_cache_layer_to_group_(std::move(kv_cache_layer_to_group)) {
+    std::optional<CacheLayerLayout> kv_cache_layer_layout = std::nullopt;
+    if (resource_context_.cache_manager) {
+        kv_cache_layer_layout = resource_context_.cache_manager->getMainModelCacheLayerLayout();
+    }
     GptModelInitParams model_init_params(
         {params.gpt_weights,
          Executor::genModelDescription(model_config_, parallelism_config, eplb_config, params.moe_config),
-         nullopt,  // no kv cache buffer for embedding executor
+         kv_cache_layer_layout,
          0,
          parallelism_config,
          params.hw_kernel_config,
@@ -73,7 +87,10 @@ EmbeddingExecutor::EmbeddingExecutor(const EngineInitParams& params, py::object 
          params.model_config_.max_seq_len,
          params.model_config_.hidden_size,
          params.model_config_.attn_config.tokens_per_block,
-         params.model_config_.attn_config.kernel_tokens_per_block});
+         params.model_config_.attn_config.kernel_tokens_per_block,
+         kv_cache_group_num_,
+         std::vector<int32_t>(kv_cache_layer_to_group_.begin(), kv_cache_layer_to_group_.end()),
+         resource_context_.cache_manager});
 
     RTP_LLM_CHECK_WITH_INFO(!params.py_model.is_none(), "py_model must be provided, legacy C++ GptModel path removed");
     RTP_LLM_LOG_INFO("init executor with python model");
@@ -98,12 +115,94 @@ void EmbeddingExecutor::init_position_ids(int max_seq_len) {
     max_position_ids_tensor_ = torch::arange(max_seq_len, torch::kInt32);
 }
 
+absl::Status EmbeddingExecutor::initKVCache(const std::list<EmbeddingStreamPtr>& streams) const {
+    for (auto& stream : streams) {
+        RETURN_IF_STATUS_ERROR(stream->initKVCache(resource_context_, model_config_));
+    }
+    bool any_cache_stream = false;
+    bool all_cache_stream = !streams.empty();
+    for (auto& stream : streams) {
+        any_cache_stream = any_cache_stream || stream->hasKVCache();
+        all_cache_stream = all_cache_stream && stream->hasKVCache();
+    }
+    if (any_cache_stream && !all_cache_stream) {
+        for (auto& stream : streams) {
+            stream->releaseKVCache(false);
+        }
+        RTP_LLM_LOG_DEBUG("embedding kv cache disabled for a mixed cache/non-cache batch");
+    }
+    return absl::OkStatus();
+}
+
+size_t EmbeddingExecutor::maxKVCacheBlocks(const std::list<EmbeddingStreamPtr>& streams) const {
+    size_t max_blocks_num = 0;
+    for (auto& stream : streams) {
+        if (stream->hasKVCache() && stream->kvCacheResource()) {
+            max_blocks_num = std::max(max_blocks_num, static_cast<size_t>(stream->kvCacheResource()->curBlocksNum()));
+        }
+    }
+    return max_blocks_num;
+}
+
+void EmbeddingExecutor::fillKVCacheMetadata(GptModelInputs& model_input) const {
+    if (!resource_context_.cache_manager || !model_input.kv_cache_layer_to_group.defined()) {
+        return;
+    }
+    const auto& cache_config = resource_context_.cache_manager->cacheConfig();
+    if (model_input.kv_cache_layer_to_group.defined()) {
+        std::memcpy(model_input.kv_cache_layer_to_group.data_ptr<int32_t>(),
+                    cache_config.layer_to_group_id.data(),
+                    cache_config.layer_to_group_id.size() * sizeof(int32_t));
+    }
+    if (model_input.kv_cache_group_types.defined()) {
+        auto* dst = model_input.kv_cache_group_types.data_ptr<int32_t>();
+        for (size_t group_idx = 0; group_idx < cache_config.group_types.size(); ++group_idx) {
+            dst[group_idx] = static_cast<int32_t>(cache_config.group_types[group_idx]);
+        }
+    }
+}
+
+void EmbeddingExecutor::copyKVCacheBlocks(GptModelInputs&             model_input,
+                                          const BatchKVCacheResource& kv_cache,
+                                          int                         model_batch_idx,
+                                          size_t                      max_blocks_num,
+                                          size_t                      kernel_blocks_per_kv_block) const {
+    if (!model_input.kv_cache_kernel_block_id.defined() || max_blocks_num == 0) {
+        return;
+    }
+    RTP_LLM_CHECK_WITH_INFO(model_input.kv_cache_kernel_block_id.dim() == 3,
+                            "embedding kv_cache_kernel_block_id must be 3-D");
+    RTP_LLM_CHECK_WITH_INFO(model_input.kv_cache_block_id.dim() == 3, "embedding kv_cache_block_id must be 3-D");
+
+    const size_t batch           = model_input.kv_cache_kernel_block_id.size(1);
+    int32_t*     kernel_dst_base = model_input.kv_cache_kernel_block_id.data_ptr<int32_t>();
+    int32_t*     store_dst_base  = model_input.kv_cache_block_id.data_ptr<int32_t>();
+
+    for (int gid = 0; gid < kv_cache.groupNums(); ++gid) {
+        const auto& kernel_blocks = kv_cache.kernelBlocks(0, gid);
+        int32_t*    kernel_dst =
+            kernel_dst_base
+            + (static_cast<size_t>(gid) * batch + static_cast<size_t>(model_batch_idx)) * max_blocks_num
+                  * kernel_blocks_per_kv_block;
+        std::memcpy(kernel_dst, kernel_blocks.data(), kernel_blocks.size() * sizeof(int32_t));
+
+        const auto& physical_blocks = kv_cache.blocks(0, gid);
+        int32_t*    store_dst =
+            store_dst_base + (static_cast<size_t>(gid) * batch + static_cast<size_t>(model_batch_idx)) * max_blocks_num;
+        std::memcpy(store_dst, physical_blocks.data(), physical_blocks.size() * sizeof(int32_t));
+    }
+}
+
 absl::StatusOr<GptModelInputs> EmbeddingExecutor::gatherModelInput(const std::list<EmbeddingStreamPtr>& streams) const {
     int64_t token_num  = 0;
     int64_t batch_size = 0;
     calcTokenNum(streams, token_num, batch_size);
     GptModelInputs model_input;
     auto           i32_options = torch::TensorOptions(torch::kInt32).pinned_memory(true);
+    const size_t max_blocks_num = maxKVCacheBlocks(streams);
+    const auto*  cache_config =
+        resource_context_.cache_manager ? &resource_context_.cache_manager->cacheConfig() : nullptr;
+    const size_t kernel_blocks_per_kv_block = cache_config ? cache_config->kernelBlocksPerKvBlock() : 1;
 
     model_input.combo_tokens          = torch::empty({token_num}, i32_options);
     model_input.combo_tokens_type_ids = torch::empty({token_num}, i32_options);
@@ -111,6 +210,22 @@ absl::StatusOr<GptModelInputs> EmbeddingExecutor::gatherModelInput(const std::li
     model_input.input_lengths         = torch::empty({batch_size}, i32_options);
     model_input.sequence_lengths      = torch::empty({0}, i32_options);
     model_input.prefix_lengths        = torch::zeros({batch_size}, i32_options);
+    if (max_blocks_num > 0 && cache_config) {
+        model_input.kv_cache_kernel_block_id =
+            torch::zeros({(int64_t)cache_config->groupNums(),
+                          batch_size,
+                          (int64_t)(max_blocks_num * kernel_blocks_per_kv_block)},
+                         i32_options);
+        model_input.kv_cache_block_id =
+            torch::zeros({(int64_t)cache_config->groupNums(), batch_size, (int64_t)max_blocks_num}, i32_options);
+        model_input.kv_cache_layer_to_group = torch::empty({(int64_t)cache_config->layer_all_num}, i32_options);
+        model_input.kv_cache_group_types    = torch::empty({(int64_t)cache_config->groupNums()}, i32_options);
+        model_input.kv_block_stride_bytes   = cache_config->kv_block_stride_bytes;
+        model_input.kv_scale_stride_bytes   = cache_config->kv_scale_stride_bytes;
+        model_input.seq_size_per_block        = cache_config->seq_size_per_block;
+        model_input.kernel_seq_size_per_block = cache_config->kernel_seq_size_per_block;
+        fillKVCacheMetadata(model_input);
+    }
     int* merged_tokens                = model_input.combo_tokens.data_ptr<int>();
     int* input_lengths                = model_input.input_lengths.data_ptr<int>();
     int* merged_positon_ids           = model_input.combo_position_ids.data_ptr<int>();
@@ -129,9 +244,13 @@ absl::StatusOr<GptModelInputs> EmbeddingExecutor::gatherModelInput(const std::li
     std::vector<int>           gathered_input_embeddings_locs;
     merged_text_mask.resize(token_num, 1);
     for (auto& stream : streams) {
-        int         length     = stream->inputLength();
-        int         batchSize  = stream->batchSize();
+        const int   prefix_length  = static_cast<int>(stream->prefixLength());
+        const int   length         = static_cast<int>(stream->contextLength());
+        const int   batchSize      = stream->batchSize();
         const auto& mm_feature = stream->multimodalFeature();
+        if (length <= 0) {
+            return absl::InternalError("embedding kv cache leaves no context token to execute");
+        }
         if (mm_feature.has_value()) {
             for (const auto& feature : mm_feature.value().features) {
                 gathered_mm_features.emplace_back(feature);
@@ -151,26 +270,47 @@ absl::StatusOr<GptModelInputs> EmbeddingExecutor::gatherModelInput(const std::li
             gathered_input_embeddings.emplace_back(stream->embeddingInput()->input_embeddings.value().cpu());
             gathered_input_embeddings_locs.push_back(token_idx);
         }
-        memcpy(
-            merged_tokens + (int)token_idx, stream->embeddingInput()->token_ids.data_ptr(), length * sizeof(int32_t));
-        memcpy(merged_token_type_ids + (int)token_idx,
-               stream->embeddingInput()->token_type_ids.data_ptr(),
+        memcpy(merged_tokens + (int)token_idx,
+               stream->embeddingInput()->token_ids.data_ptr<int32_t>() + prefix_length,
                length * sizeof(int32_t));
-        memcpy(input_lengths + (int)batch_idx,
-               stream->embeddingInput()->input_lengths.data_ptr(),
-               stream->batchSize() * sizeof(int32_t));
+        memcpy(merged_token_type_ids + (int)token_idx,
+               stream->embeddingInput()->token_type_ids.data_ptr<int32_t>() + prefix_length,
+               length * sizeof(int32_t));
         int length_idx = 0;
-        for (int i = 0; i < batchSize; i++) {
-            int seqLen = stream->embeddingInput()->input_lengths.data_ptr<int32_t>()[i];
-            RTP_LLM_CHECK_WITH_INFO(seqLen + position_bias <= (int)max_position_ids_tensor_.size(0),
-                                    "seqlen(%d) + position_bias(%d) exceed max_position_length(%d)",
-                                    int(seqLen),
-                                    int(position_bias),
+        if (stream->hasKVCache()) {
+            input_lengths[batch_idx] = length;
+            model_input.prefix_lengths.data_ptr<int32_t>()[batch_idx] = prefix_length;
+            RTP_LLM_CHECK_WITH_INFO(prefix_length + length + position_bias <= (int)max_position_ids_tensor_.size(0),
+                                    "prefix_length(%d) + seqlen(%d) + position_bias(%d) exceed max_position_length(%d)",
+                                    prefix_length,
+                                    length,
+                                    position_bias,
                                     (int)max_position_ids_tensor_.size(0));
             memcpy(merged_positon_ids + token_idx + length_idx,
-                   max_position_ids_tensor_.data_ptr<int32_t>() + position_bias,
-                   seqLen * sizeof(int32_t));
-            length_idx += seqLen;
+                   max_position_ids_tensor_.data_ptr<int32_t>() + position_bias + prefix_length,
+                   length * sizeof(int32_t));
+            length_idx += length;
+            copyKVCacheBlocks(model_input,
+                              *stream->kvCacheResource(),
+                              batch_idx,
+                              max_blocks_num,
+                              kernel_blocks_per_kv_block);
+        } else {
+            memcpy(input_lengths + (int)batch_idx,
+                   stream->embeddingInput()->input_lengths.data_ptr(),
+                   stream->batchSize() * sizeof(int32_t));
+            for (int i = 0; i < batchSize; i++) {
+                int seqLen = stream->embeddingInput()->input_lengths.data_ptr<int32_t>()[i];
+                RTP_LLM_CHECK_WITH_INFO(seqLen + position_bias <= (int)max_position_ids_tensor_.size(0),
+                                        "seqlen(%d) + position_bias(%d) exceed max_position_length(%d)",
+                                        int(seqLen),
+                                        int(position_bias),
+                                        (int)max_position_ids_tensor_.size(0));
+                memcpy(merged_positon_ids + token_idx + length_idx,
+                       max_position_ids_tensor_.data_ptr<int32_t>() + position_bias,
+                       seqLen * sizeof(int32_t));
+                length_idx += seqLen;
+            }
         }
 
         if (length_idx != length) {
@@ -223,7 +363,7 @@ void EmbeddingExecutor::calcTokenNum(const list<EmbeddingStreamPtr>& streams,
     token_num  = 0;
     batch_size = 0;
     for (auto& stream : streams) {
-        token_num += stream->inputLength();
+        token_num += stream->contextLength();
         batch_size += stream->batchSize();
     }
 }
@@ -339,6 +479,7 @@ absl::StatusOr<py::object> EmbeddingExecutor::postProcess(const ModelRequest&   
 }
 
 absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& streams) {
+    RETURN_IF_STATUS_ERROR(initKVCache(streams));
     CHECK_AND_RETURN_REF(model_input, gatherModelInput(streams));
     auto            merged_output = std::make_unique<MergedOutput>();
     GptModelOutputs model_output;

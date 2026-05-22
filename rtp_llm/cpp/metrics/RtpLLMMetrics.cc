@@ -211,6 +211,7 @@ bool RtpEmbeddingStreamMetrics::init(kmonitor::MetricsGroupManager* manager) {
     REGISTER_GAUGE_MUTABLE_METRIC(total_latency_us_metric, "rtp_llm_latency_us");
     REGISTER_GAUGE_MUTABLE_METRIC(wait_latency_us_metric, "rtp_llm_wait_latency_us");
     REGISTER_GAUGE_MUTABLE_METRIC(input_token_length_metric, "rtp_llm_input_token_length");
+    REGISTER_GAUGE_MUTABLE_METRIC(reuse_length_metric, "rtp_llm_reuse_length");
     return true;
 }
 
@@ -219,6 +220,7 @@ void RtpEmbeddingStreamMetrics::report(const kmonitor::MetricsTags*        tags,
     REPORT_GAUGE(total_latency_us);
     REPORT_GAUGE(wait_latency_us);
     REPORT_GAUGE(input_token_length);
+    REPORT_GAUGE(reuse_length);
 }
 
 bool RtpLLMSchedulerMetrics::init(kmonitor::MetricsGroupManager* manager) {

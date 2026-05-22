@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
+#include "rtp_llm/cpp/cache/CacheConfigCreator.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
@@ -30,11 +31,54 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
                              params.model_config_.mla_ops_type);
     }
     warmupNoBlockCopy();
-    executor_.reset(new EmbeddingExecutor(params, handler));
+    resource_context_.initCacheConfig(
+        params.kv_cache_config, params.runtime_config.fifo_scheduler_config, params.model_config_.max_seq_len);
+    initCacheManager(params);
+    executor_.reset(
+        new EmbeddingExecutor(params, handler, resource_context_, kv_cache_group_num_, kv_cache_layer_to_group_));
     scheduler_.reset(
         new EmbeddingScheduler(model_config_, concurrency_config, params.runtime_config, metrics_reporter_));
 
     (void)startLoop();
+}
+
+void EmbeddingEngine::initCacheManager(const EngineInitParams& params) {
+    if (!resource_context_.reuse_cache) {
+        RTP_LLM_LOG_INFO("embedding kv cache reuse disabled");
+        return;
+    }
+    const bool supports_embedding_cache = model_config_.model_type == "qwen_3_idle_fish_embedding"
+                                          && model_config_.task_type == TaskType::DENSE_EMBEDDING
+                                          && model_config_.attn_config.is_causal;
+    if (!supports_embedding_cache) {
+        resource_context_.reuse_cache = false;
+        RTP_LLM_LOG_INFO("embedding kv cache reuse disabled for model_type=%s task_type=%d is_causal=%d",
+                         model_config_.model_type.c_str(),
+                         static_cast<int>(model_config_.task_type),
+                         static_cast<int>(model_config_.attn_config.is_causal));
+        return;
+    }
+
+    auto cache_config = CacheConfigCreator::createConfig(
+        model_config_, parallelism_config, params.runtime_config, params.kv_cache_config, std::nullopt);
+    RTP_LLM_LOG_INFO("create embedding cache manager with config %s", cache_config.debugString().c_str());
+    resource_context_.cache_manager =
+        make_shared<KVCacheManager>(cache_config,
+                                    false,
+                                    metrics_reporter_,
+                                    params.kv_cache_config,
+                                    parallelism_config,
+                                    params.runtime_config,
+                                    params.sp_config,
+                                    params.pd_sep_config,
+                                    params.cache_store_config);
+    resource_context_.role_type = params.pd_sep_config.role_type;
+    if (!resource_context_.cache_manager->init()) {
+        RTP_LLM_FAIL("init embedding kv cache manager failed");
+    }
+    const auto& cache_cfg    = resource_context_.cache_manager->cacheConfig();
+    kv_cache_group_num_      = cache_cfg.groupNums();
+    kv_cache_layer_to_group_ = cache_cfg.layer_to_group_id;
 }
 
 EmbeddingEngine::~EmbeddingEngine() {
