@@ -510,8 +510,11 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
                 # No RoPE, just split QKV
                 query, key, value = self._split_qkv(qkv)
 
-            # Write KV to cache
-            self.kv_cache_write_op.forward(key, value, kv_cache)
+            # Write KV to cache. Skip when kv_cache is None (embedding models)
+            # to avoid the dummy paged-cache allocation + write that would otherwise
+            # run on every prefill step.
+            if kv_cache is not None:
+                self.kv_cache_write_op.forward(key, value, kv_cache)
 
             # Pass query to FMHA (for paged) or reconstruct qkv (for ragged)
             qkv = self._prepare_fmha_input(query, key, value)
