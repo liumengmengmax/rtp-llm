@@ -115,6 +115,14 @@ absl::Status EmbeddingStream::initKVCache(const ResourceContext& resource_contex
     local_reuse_length_ = result.reuse_len;
     kv_cache_enabled_   = true;
     kv_cache_released_  = false;
+    if (prefix_length_ >= inputLength()) {
+        RTP_LLM_LOG_DEBUG("embedding stream [%ld] full kv cache hit (%ld/%ld), fallback to uncached execution",
+                          streamId(),
+                          prefix_length_,
+                          inputLength());
+        releaseKVCache(false);
+        return absl::OkStatus();
+    }
     RTP_LLM_LOG_DEBUG("embedding stream [%ld] init kv cache, prefix=%ld, blocks=%d",
                       streamId(),
                       prefix_length_,
