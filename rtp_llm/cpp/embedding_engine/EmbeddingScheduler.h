@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <queue>
 #include "rtp_llm/cpp/embedding_engine/EmbeddingStream.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
@@ -32,6 +33,7 @@ private:
     const ModelConfig             model_config_;
     const ConcurrencyConfig       concurrency_config_;
     const RuntimeConfig           runtime_config_;
+    int64_t                       max_schedule_tokens_ = 0;
     std::list<EmbeddingStreamPtr> waiting_streams_;
     std::atomic<bool>             stop_ = false;
     std::mutex                    lock_;
