@@ -21,6 +21,7 @@ __all__ = [
     "fused_add_layernorm",
     "fused_add_rmsnorm",
     "fused_qk_rmsnorm",
+    "gather_add_rmsnorm",
     "l2norm",
     "write_cache_store",
     "FlashInferMlaAttnParams",
@@ -109,6 +110,18 @@ def fused_add_rmsnorm(
 ) -> None:
     """
     Fused Add RMSNorm kernel
+    """
+
+def gather_add_rmsnorm(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    indices: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    """
+    Gather indexed rows, add residual, and apply RMSNorm
     """
 
 def fused_qk_rmsnorm(

@@ -142,6 +142,20 @@ cc_library(
 )
 
 cc_library(
+    name = "gather_add_rmsnorm",
+    srcs = ["gather_add_rmsnorm.cu"],
+    hdrs = ["gather_add_rmsnorm.h"],
+    deps = [
+        "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+        "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
+        ":cuda_utils_common",
+        "//rtp_llm/cpp/utils:core_utils",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "mla_quant_kernel",
     srcs = ["mla_quant_kernel.cu"],
     hdrs = ["mla_quant_kernel.h"],
@@ -162,6 +176,7 @@ cc_library(
         ":cuda_quantization",
         ":cuda_fused_qk_rmsnorm",
         ":l2norm",
+        ":gather_add_rmsnorm",
         ":mla_quant_kernel",
     ],
     visibility = ["//visibility:public"],
