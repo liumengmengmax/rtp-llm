@@ -21,6 +21,7 @@ __all__ = [
     "fused_add_layernorm",
     "fused_add_rmsnorm",
     "fused_qk_rmsnorm",
+    "l2norm",
     "write_cache_store",
     "FlashInferMlaAttnParams",
     "layernorm",
@@ -148,6 +149,15 @@ def layernorm(
 ) -> None:
     """
     LayerNorm kernel
+    """
+
+def l2norm(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    eps: float = 1e-12,
+) -> None:
+    """
+    Row-wise L2 normalization kernel
     """
 
 def rmsnorm(
