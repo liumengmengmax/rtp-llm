@@ -106,6 +106,7 @@ private:
     void              initKernelInternalMemory();
     void              logCudaGraphPoolMemory(const char* phase);
     bool              isCompactEmbeddingPrefillGraph() const;
+    int               prefillOutputRows(const CudaGraphState& state) const;
     void              prepareCompactEmbeddingPrefillLengths(PyModelInputs& inputs, int seq_len) const;
     void              setPositionEncoding(torch::Tensor position_encoding) override;
     void              setTokenTypeEmbedding(torch::Tensor token_type_embedding) override;
@@ -137,6 +138,7 @@ private:
     int                     hidden_size_{0};
     int                     output_hidden_size_{
         0};  // Actual model output dimension (may differ from hidden_size_ for embedding models with MLP projection)
+    bool             is_prefill_pooled_output_{false};
     int              sp_steps_{0};
     std::vector<int> capture_range_;
     std::vector<int> prefill_capture_seq_lens_;    // Pre-configured sequence lengths from Python
