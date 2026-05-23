@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple
 
 import flashinfer
@@ -101,10 +102,26 @@ class FusedQKRMSNorm(nn.Module):
         self.q_size = self.head_num * self.size_per_head
         self.kv_size = self.kv_head_num * self.size_per_head
         self.enable_pdl = enable_pdl
+        self.use_rtp_fused_qk_norm = (
+            os.environ.get("IDLE_FISH_ENABLE_RTP_FUSED_QK_RMSNORM", "0") == "1"
+        )
 
     def forward(self, hidden_states: torch.Tensor):
         assert hidden_states.dim() == 2
         m, n = hidden_states.shape
+        if self.use_rtp_fused_qk_norm:
+            rtp_llm_ops.fused_qk_rmsnorm(
+                hidden_states,
+                self.q_weight,
+                self.k_weight,
+                self.eps,
+                self.head_num,
+                self.kv_head_num,
+                m,
+                n,
+                self.size_per_head,
+            )
+            return hidden_states
         qkv = hidden_states.reshape(
             m, (self.head_num + self.kv_head_num * 2), self.size_per_head
         )
