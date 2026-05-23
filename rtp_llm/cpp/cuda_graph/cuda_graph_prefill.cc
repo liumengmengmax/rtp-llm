@@ -68,8 +68,9 @@ void CudaGraphRunner::capturePrefill() {
         graph_instances_[seq_len].mem_hold_ = createCaptureMemoryHold(inputs, max_bs_ * num_tokens_per_bs_);
         graph_instances_[seq_len].mem_hold_.attn_pyobj_ =
             py_attn_pyobj_method_(graph_instances_[seq_len].mem_hold_.py_model_inputs_, true);
+        const int output_rows = is_prefill_pooled_output_ ? static_cast<int>(max_bs_) : seq_len;
         graph_instances_[seq_len].mem_hold_.decoder_layer_hidden_states_ =
-            graph_instances_[seq_len].mem_hold_.decoder_layer_hidden_states_.slice(0, 0, seq_len);
+            graph_instances_[seq_len].mem_hold_.decoder_layer_hidden_states_.slice(0, 0, output_rows);
         capturePrefillOneSeqLen(seq_len);
         replayAndSyncCheck(seq_len, "seq len");
         RTP_LLM_LOG_INFO("capture success for seq_len: %d", seq_len);

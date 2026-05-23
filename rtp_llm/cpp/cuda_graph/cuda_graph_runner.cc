@@ -50,6 +50,10 @@ bool CudaGraphRunner::isCompactEmbeddingPrefillGraph() const {
     return is_prefill_cuda_graph_mode_ && num_tokens_per_bs_ == max_seq_len_;
 }
 
+int CudaGraphRunner::prefillOutputRows(const CudaGraphState& state) const {
+    return is_prefill_pooled_output_ ? state.current_batch_size : state.current_seq_len;
+}
+
 void CudaGraphRunner::prepareCompactEmbeddingPrefillLengths(PyModelInputs& inputs, int seq_len) const {
     RTP_LLM_CHECK_WITH_INFO(seq_len > 0, "compact embedding prefill capture seq_len must be positive");
 
@@ -339,7 +343,7 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
         }
         outputs.hidden_states =
             graph_instances_[state.current_real_graph_seq_len].mem_hold_.decoder_layer_hidden_states_.slice(
-                0, 0, state.current_seq_len);
+                0, 0, prefillOutputRows(state));
     } else {
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
@@ -691,10 +695,15 @@ void CudaGraphRunner::initCapture() {
         auto init_outputs     = init_outputs_obj.cast<PyModelOutputs>();
         RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
         // Use actual model output dimension (may differ from hidden_size_ for models with final projection)
-        output_hidden_size_ = init_outputs.hidden_states.size(-1);
-        auto output_dtype   = init_outputs.hidden_states.options();
-        RTP_LLM_LOG_INFO(
-            "initCapture: model hidden_size=%d, actual output_hidden_size=%d", hidden_size_, output_hidden_size_);
+        output_hidden_size_       = init_outputs.hidden_states.size(-1);
+        auto output_dtype         = init_outputs.hidden_states.options();
+        is_prefill_pooled_output_ = is_prefill_cuda_graph_mode_ && init_outputs.hidden_states.size(0) != max_num_token_;
+        RTP_LLM_LOG_INFO("initCapture: model hidden_size=%d, actual output_hidden_size=%d, output_rows=%ld, "
+                         "prefill_pooled_output=%d",
+                         hidden_size_,
+                         output_hidden_size_,
+                         static_cast<long>(init_outputs.hidden_states.size(0)),
+                         is_prefill_pooled_output_);
         output = torch::zeros({max_num_token_, output_hidden_size_}, output_dtype);
         capture_mem_hold_.setHiddenStates(output);
         initCaptureAttentionInputsPost();
@@ -802,7 +811,20 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
                 RTP_LLM_LOG_ERROR("Capture forward failed for %s %d: %s", key_type, key, e.what());
                 throw;
             }
-            graph_instances_[key].mem_hold_.decoder_layer_hidden_states_.copy_(outputs.hidden_states);
+            auto& dst = graph_instances_[key].mem_hold_.decoder_layer_hidden_states_;
+            RTP_LLM_CHECK_WITH_INFO(outputs.hidden_states.dim() == dst.dim(),
+                                    "CudaGraph output dim mismatch: output_dim=%ld, dst_dim=%ld",
+                                    static_cast<long>(outputs.hidden_states.dim()),
+                                    static_cast<long>(dst.dim()));
+            RTP_LLM_CHECK_WITH_INFO(outputs.hidden_states.size(-1) == dst.size(-1),
+                                    "CudaGraph output hidden size mismatch: output_hidden=%ld, dst_hidden=%ld",
+                                    static_cast<long>(outputs.hidden_states.size(-1)),
+                                    static_cast<long>(dst.size(-1)));
+            RTP_LLM_CHECK_WITH_INFO(outputs.hidden_states.size(0) <= dst.size(0),
+                                    "CudaGraph output rows exceed destination rows: output_rows=%ld, dst_rows=%ld",
+                                    static_cast<long>(outputs.hidden_states.size(0)),
+                                    static_cast<long>(dst.size(0)));
+            dst.slice(0, 0, outputs.hidden_states.size(0)).copy_(outputs.hidden_states);
             graph.capture_end();
         }
 
