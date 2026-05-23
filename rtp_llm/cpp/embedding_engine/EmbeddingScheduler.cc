@@ -1,16 +1,31 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingScheduler.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include <algorithm>
 #include <mutex>
 
 using namespace std;
 namespace rtp_llm {
 
-EmbeddingScheduler::EmbeddingScheduler(const ModelConfig& model_config,
-                                       const ConcurrencyConfig& concurrency_config,
-                                       const RuntimeConfig& runtime_config,
+EmbeddingScheduler::EmbeddingScheduler(const ModelConfig&                 model_config,
+                                       const ConcurrencyConfig&           concurrency_config,
+                                       const RuntimeConfig&               runtime_config,
                                        const kmonitor::MetricsReporterPtr metrics_reporter):
-    model_config_(model_config), concurrency_config_(concurrency_config), runtime_config_(runtime_config), metrics_reporter_(metrics_reporter) {}
+    model_config_(model_config),
+    concurrency_config_(concurrency_config),
+    runtime_config_(runtime_config),
+    metrics_reporter_(metrics_reporter) {
+    const int64_t max_context_tokens =
+        static_cast<int64_t>(runtime_config_.fifo_scheduler_config.max_context_batch_size) * model_config_.max_seq_len;
+    const int64_t max_batch_tokens = runtime_config_.fifo_scheduler_config.max_batch_tokens_size;
+    max_schedule_tokens_ = max_batch_tokens > 0 ? std::min(max_context_tokens, max_batch_tokens) : max_context_tokens;
+    RTP_LLM_LOG_INFO(
+        "EmbeddingScheduler max_schedule_tokens=%ld (max_context_batch_size=%ld, max_seq_len=%d, max_batch_tokens_size=%ld)",
+        max_schedule_tokens_,
+        runtime_config_.fifo_scheduler_config.max_context_batch_size,
+        model_config_.max_seq_len,
+        max_batch_tokens);
+}
 
 EmbeddingScheduler::~EmbeddingScheduler() {
     (void)stop();
@@ -36,11 +51,11 @@ absl::StatusOr<list<EmbeddingStreamPtr>> EmbeddingScheduler::scheduleNew() {
     unique_lock<mutex> lock(lock_);
     cond_.wait(lock, [this] { return stop_ || !waiting_streams_.empty(); });
     std::list<EmbeddingStreamPtr> new_streams;
-    int                           total_len = 0;
+    int64_t                       total_len = 0;
     auto                          it        = waiting_streams_.begin();
     while (it != waiting_streams_.end()) {
         const auto& stream = *it;
-        if (total_len + stream->inputLength() > runtime_config_.fifo_scheduler_config.max_context_batch_size * model_config_.max_seq_len) {
+        if (total_len + stream->inputLength() > max_schedule_tokens_) {
             break;
         }
         stream->setStart();
