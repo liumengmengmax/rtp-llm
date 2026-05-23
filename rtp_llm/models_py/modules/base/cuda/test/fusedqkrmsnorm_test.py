@@ -1,5 +1,7 @@
 import itertools
+import os
 from unittest import SkipTest, TestCase, main
+from unittest.mock import patch
 
 import torch
 from torch import dtype as _dtype
@@ -47,17 +49,17 @@ class FusedQKRMSNormTest(TestCase):
 
         x = torch.randn(num_tokens, hidden_size, dtype=dtype)
 
-        # for _ in range(5):
-        #     # out = qkrmsnorm(x)
-        #     out = fused_qkrmsnorm(x)
-        # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-        #     for _ in range(10):
-        #         # out = qkrmsnorm(x)
-        #         out = fused_qkrmsnorm(x)
-        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
-
+        ref = qkrmsnorm(x)
         self.assertTrue(
-            torch.allclose(qkrmsnorm(x), fused_qkrmsnorm(x), atol=1e-2, rtol=1e-2)
+            torch.allclose(ref, fused_qkrmsnorm(x.clone()), atol=1e-2, rtol=1e-2)
+        )
+
+        with patch.dict(os.environ, {"IDLE_FISH_ENABLE_RTP_FUSED_QK_RMSNORM": "1"}):
+            rtp_fused_qkrmsnorm = FusedQKRMSNorm(
+                q_weight, k_weight, head_num, kv_head_num, size_per_head
+            )
+        self.assertTrue(
+            torch.allclose(ref, rtp_fused_qkrmsnorm(x.clone()), atol=1e-2, rtol=1e-2)
         )
 
     def test_fusedqkrmsnorm(self):
