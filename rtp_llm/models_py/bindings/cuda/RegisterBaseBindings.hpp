@@ -20,6 +20,7 @@
 #include "rtp_llm/models_py/bindings/cuda/UserBuffersOp.h"
 #include "rtp_llm/models_py/bindings/cuda/FakeBalanceExpertOp.h"
 #include "rtp_llm/models_py/bindings/cuda/GatherAddRMSNormOp.h"
+#include "rtp_llm/models_py/bindings/cuda/IdleFishMlpL2NormOp.h"
 #include "rtp_llm/models_py/bindings/cuda/L2NormOp.h"
 
 #include "rtp_llm/models_py/bindings/cuda/kernels/mla_quant_kernel.h"
@@ -90,6 +91,15 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("indices"),
                   py::arg("weight"),
                   py::arg("eps") = 1e-6);
+
+    rtp_ops_m.def("idlefish_mlp_l2norm",
+                  &idleFishMlpL2Norm,
+                  "IdleFish embedding MLP projection fused with row-wise L2 normalization",
+                  py::arg("output"),
+                  py::arg("input"),
+                  py::arg("weight"),
+                  py::arg("bias"),
+                  py::arg("eps") = 1e-12);
 
     rtp_ops_m.def("fused_qk_rmsnorm",
                   &FusedQKRMSNorm,
