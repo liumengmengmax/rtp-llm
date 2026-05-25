@@ -37,8 +37,10 @@ void fusedQKNormRope(at::Tensor& qkv,
     CHECK_EQ(rotary_dim % (head_dim / 32), 0);
     TORCH_CHECK(rope_scale > 0.0, "rope_scale must be positive");
 
+    const int64_t rotary_lanes = rotary_dim / (head_dim / 32);
+    TORCH_CHECK(rotary_lanes > 0, "rotary_lanes must be positive");
     if (is_neox_style) {
-        const int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
+        const int64_t half_rotary_lanes = rotary_lanes / 2;
         TORCH_CHECK(half_rotary_lanes > 0, "half_rotary_lanes must be positive");
         CHECK_EQ(half_rotary_lanes & (half_rotary_lanes - 1), 0);
     }
@@ -99,8 +101,10 @@ void fusedQKNormRopeWithCache(at::Tensor& qkv,
     CHECK_EQ(rope_cache.size(1), rotary_dim);
     TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even for rope cache");
 
+    const int64_t rotary_lanes = rotary_dim / (head_dim / 32);
+    TORCH_CHECK(rotary_lanes > 0, "rotary_lanes must be positive");
     if (is_neox_style) {
-        const int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
+        const int64_t half_rotary_lanes = rotary_lanes / 2;
         TORCH_CHECK(half_rotary_lanes > 0, "half_rotary_lanes must be positive");
         CHECK_EQ(half_rotary_lanes & (half_rotary_lanes - 1), 0);
     }
