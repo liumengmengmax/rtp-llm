@@ -22,6 +22,7 @@
 #include "rtp_llm/models_py/bindings/cuda/GatherAddRMSNormOp.h"
 #include "rtp_llm/models_py/bindings/cuda/IdleFishMlpL2NormOp.h"
 #include "rtp_llm/models_py/bindings/cuda/L2NormOp.h"
+#include "rtp_llm/models_py/bindings/cuda/FusedQKNormRopeOp.h"
 
 #include "rtp_llm/models_py/bindings/cuda/kernels/mla_quant_kernel.h"
 
@@ -113,6 +114,39 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("m"),
                   py::arg("n"),
                   py::arg("norm_size"));
+
+    rtp_ops_m.def("fused_qk_norm_rope",
+                  &fusedQKNormRope,
+                  "Fused QK RMSNorm and Base RoPE kernel",
+                  py::arg("qkv"),
+                  py::arg("q_weight"),
+                  py::arg("k_weight"),
+                  py::arg("position_ids"),
+                  py::arg("eps"),
+                  py::arg("num_heads_q"),
+                  py::arg("num_heads_k"),
+                  py::arg("num_heads_v"),
+                  py::arg("head_dim"),
+                  py::arg("rope_base"),
+                  py::arg("is_neox_style"),
+                  py::arg("rope_scale"),
+                  py::arg("rotary_dim"));
+
+    rtp_ops_m.def("fused_qk_norm_rope_with_cache",
+                  &fusedQKNormRopeWithCache,
+                  "Fused QK RMSNorm and cached Base RoPE kernel",
+                  py::arg("qkv"),
+                  py::arg("q_weight"),
+                  py::arg("k_weight"),
+                  py::arg("position_ids"),
+                  py::arg("rope_cache"),
+                  py::arg("eps"),
+                  py::arg("num_heads_q"),
+                  py::arg("num_heads_k"),
+                  py::arg("num_heads_v"),
+                  py::arg("head_dim"),
+                  py::arg("is_neox_style"),
+                  py::arg("rotary_dim"));
 
     rtp_ops_m.def("layernorm",
                   &layernorm,

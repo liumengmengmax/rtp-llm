@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
@@ -8,8 +9,13 @@
 #include "autil/EnvUtil.h"
 #include <c10/core/InferenceMode.h>
 #include <algorithm>
+#include <cctype>
 #include <exception>
+#include <limits>
+#include <list>
+#include <sstream>
 #include <string>
+#include <vector>
 
 using namespace std;
 namespace rtp_llm {
@@ -33,13 +39,120 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     warmupNoBlockCopy();
     resource_context_.initCacheConfig(
         params.kv_cache_config, params.runtime_config.fifo_scheduler_config, params.model_config_.max_seq_len);
+    initEmbeddingPrefixCacheConfig();
     initCacheManager(params);
     executor_.reset(
         new EmbeddingExecutor(params, handler, resource_context_, kv_cache_group_num_, kv_cache_layer_to_group_));
+    THROW_IF_STATUS_ERROR(buildEmbeddingPrefixCache());
     scheduler_.reset(
         new EmbeddingScheduler(model_config_, concurrency_config, params.runtime_config, metrics_reporter_));
 
     (void)startLoop();
+}
+
+namespace {
+
+std::vector<int32_t> parseEmbeddingPrefixTokens(const std::string& raw_tokens) {
+    std::string normalized;
+    normalized.reserve(raw_tokens.size());
+    for (char ch : raw_tokens) {
+        normalized.push_back((ch == ',' || ch == '[' || ch == ']') ? ' ' : ch);
+    }
+
+    std::vector<int32_t> tokens;
+    std::stringstream    ss(normalized);
+    long long            value = 0;
+    while (ss >> value) {
+        RTP_LLM_CHECK_WITH_INFO(value >= 0 && value <= std::numeric_limits<int32_t>::max(),
+                                "invalid embedding prefix token id: %lld",
+                                value);
+        tokens.push_back(static_cast<int32_t>(value));
+    }
+    return tokens;
+}
+
+}  // namespace
+
+void EmbeddingEngine::initEmbeddingPrefixCacheConfig() {
+    const bool enable_prefix_cache = autil::EnvUtil::getEnv("IDLE_FISH_ENABLE_EMBEDDING_PREFIX_CACHE", false);
+    if (!enable_prefix_cache) {
+        return;
+    }
+    const bool supports_embedding_cache = model_config_.model_type == "qwen_3_idle_fish_embedding"
+                                          && model_config_.task_type == TaskType::DENSE_EMBEDDING
+                                          && model_config_.attn_config.is_causal;
+    if (!supports_embedding_cache) {
+        RTP_LLM_LOG_WARNING("embedding resident prefix cache ignored for model_type=%s task_type=%d is_causal=%d",
+                            model_config_.model_type.c_str(),
+                            static_cast<int>(model_config_.task_type),
+                            static_cast<int>(model_config_.attn_config.is_causal));
+        return;
+    }
+
+    const std::string raw_tokens = autil::EnvUtil::getEnv("IDLE_FISH_EMBEDDING_PREFIX_CACHE_TOKENS", std::string(""));
+    auto              tokens     = parseEmbeddingPrefixTokens(raw_tokens);
+    RTP_LLM_CHECK_WITH_INFO(!tokens.empty(),
+                            "IDLE_FISH_ENABLE_EMBEDDING_PREFIX_CACHE=1 requires "
+                            "IDLE_FISH_EMBEDDING_PREFIX_CACHE_TOKENS");
+
+    resource_context_.embedding_prefix_cache          = std::make_shared<EmbeddingPrefixCache>();
+    resource_context_.embedding_prefix_cache->enabled = true;
+    resource_context_.embedding_prefix_cache->tokens  = std::move(tokens);
+    resource_context_.reuse_cache                     = true;
+    RTP_LLM_LOG_INFO("embedding resident prefix cache configured with %zu tokens",
+                     resource_context_.embedding_prefix_cache->tokens.size());
+}
+
+absl::Status EmbeddingEngine::buildEmbeddingPrefixCache() {
+    auto& prefix_cache = resource_context_.embedding_prefix_cache;
+    if (!prefix_cache || !prefix_cache->enabled || prefix_cache->ready) {
+        return absl::OkStatus();
+    }
+    if (!resource_context_.cache_manager) {
+        return absl::InternalError("embedding resident prefix cache requires cache manager");
+    }
+
+    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
+    auto          token_ids =
+        torch::from_blob(prefix_cache->tokens.data(), {prefix_len}, torch::TensorOptions(torch::kInt32)).clone();
+    auto token_type_ids = torch::zeros({prefix_len}, torch::TensorOptions(torch::kInt32));
+    auto input_lengths  = torch::tensor({static_cast<int32_t>(prefix_len)}, torch::TensorOptions(torch::kInt32));
+    auto input          = std::make_shared<EmbeddingInput>(token_ids, token_type_ids, input_lengths, /*request_id=*/-1);
+    auto stream         = std::make_shared<EmbeddingStream>(input);
+    stream->setMetricReporter(metrics_reporter_);
+    stream->setKeepKVCacheOnFinish(true);
+
+    std::list<EmbeddingStreamPtr> streams = {stream};
+    RETURN_IF_STATUS_ERROR(executor_->process(streams));
+    stream->waitFinish();
+    if (!stream->hasKVCache() || !stream->kvCacheResource() || !stream->completeTokenIds()) {
+        return absl::InternalError("embedding resident prefix cache build did not keep kv cache");
+    }
+
+    prefix_cache->kv_cache_resource  = stream->kvCacheResource();
+    prefix_cache->complete_token_ids = stream->completeTokenIds();
+    prefix_cache->ready              = true;
+    RTP_LLM_LOG_INFO("embedding resident prefix cache built, prefix_tokens=%ld blocks=%d",
+                     prefix_len,
+                     prefix_cache->kv_cache_resource->curBlocksNum());
+    return absl::OkStatus();
+}
+
+void EmbeddingEngine::releaseEmbeddingPrefixCache() {
+    auto& prefix_cache = resource_context_.embedding_prefix_cache;
+    if (!prefix_cache || !prefix_cache->ready || !prefix_cache->kv_cache_resource || !prefix_cache->complete_token_ids
+        || !resource_context_.cache_manager) {
+        return;
+    }
+    if (prefix_cache->kv_cache_resource->curBlocksNum() > 0) {
+        FreeInfo free_info{prefix_cache->kv_cache_resource, prefix_cache->complete_token_ids};
+        free_info.request_id = -1;
+        resource_context_.cache_manager->free(free_info);
+    }
+    prefix_cache->kv_cache_resource->clearBlocks();
+    prefix_cache->kv_cache_resource.reset();
+    prefix_cache->complete_token_ids.reset();
+    prefix_cache->ready = false;
 }
 
 void EmbeddingEngine::initCacheManager(const EngineInitParams& params) {
@@ -62,17 +175,16 @@ void EmbeddingEngine::initCacheManager(const EngineInitParams& params) {
     auto cache_config = CacheConfigCreator::createConfig(
         model_config_, parallelism_config, params.runtime_config, params.kv_cache_config, std::nullopt);
     RTP_LLM_LOG_INFO("create embedding cache manager with config %s", cache_config.debugString().c_str());
-    resource_context_.cache_manager =
-        make_shared<KVCacheManager>(cache_config,
-                                    false,
-                                    metrics_reporter_,
-                                    params.kv_cache_config,
-                                    parallelism_config,
-                                    params.runtime_config,
-                                    params.sp_config,
-                                    params.pd_sep_config,
-                                    params.cache_store_config);
-    resource_context_.role_type = params.pd_sep_config.role_type;
+    resource_context_.cache_manager = make_shared<KVCacheManager>(cache_config,
+                                                                  false,
+                                                                  metrics_reporter_,
+                                                                  params.kv_cache_config,
+                                                                  parallelism_config,
+                                                                  params.runtime_config,
+                                                                  params.sp_config,
+                                                                  params.pd_sep_config,
+                                                                  params.cache_store_config);
+    resource_context_.role_type     = params.pd_sep_config.role_type;
     if (!resource_context_.cache_manager->init()) {
         RTP_LLM_FAIL("init embedding kv cache manager failed");
     }
@@ -84,6 +196,7 @@ void EmbeddingEngine::initCacheManager(const EngineInitParams& params) {
 EmbeddingEngine::~EmbeddingEngine() {
     RTP_LLM_LOG_INFO("destory embedding engine");
     (void)stop();
+    releaseEmbeddingPrefixCache();
 }
 
 absl::Status EmbeddingEngine::startLoop() {

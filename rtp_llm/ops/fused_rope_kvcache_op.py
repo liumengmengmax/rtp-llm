@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 import torch
@@ -22,6 +23,7 @@ class FusedRopeAttnParams:
     kv_cache_offset: Optional[torch.Tensor]
     kv_cache_offset_h: Optional[torch.Tensor]
     padding_offset: Optional[torch.Tensor]
+    cp_position_ids: Optional[torch.Tensor]
     position_ids: Optional[torch.Tensor]
     cu_seqlens: torch.Tensor
     cu_kv_seqlens: torch.Tensor
@@ -33,6 +35,40 @@ class FusedRopeAttnParams:
     context_total_kv_length: int
     decode_plan: bool
     attn_type: torch.dtype
+
+
+def _make_prefill_position_ids(attn_inputs: PyAttentionInputs) -> Optional[torch.Tensor]:
+    if (
+        os.environ.get("IDLE_FISH_ENABLE_FUSED_QK_NORM_ROPE", "0") != "1"
+        and os.environ.get("IDLE_FISH_ENABLE_FUSED_QK_NORM_ROPE_CACHE", "0") != "1"
+    ):
+        return None
+    if attn_inputs.context_parallel_info is not None:
+        return None
+
+    cu_seqlens = attn_inputs.cu_seqlens
+    total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens <= 0:
+        return torch.empty(0, dtype=torch.int32, device=cu_seqlens.device)
+
+    input_lengths = attn_inputs.input_lengths.to(device=cu_seqlens.device, dtype=torch.int32)
+    position_ids = torch.arange(total_tokens, dtype=torch.int32, device=cu_seqlens.device)
+
+    if input_lengths.numel() > 1:
+        seq_starts = torch.repeat_interleave(
+            cu_seqlens[:-1].to(dtype=torch.int32), input_lengths
+        )
+        position_ids = position_ids - seq_starts
+
+    prefix_lengths = attn_inputs.prefix_lengths
+    if prefix_lengths is not None and prefix_lengths.numel() > 0:
+        prefix_offsets = torch.repeat_interleave(
+            prefix_lengths.to(device=cu_seqlens.device, dtype=torch.int32),
+            input_lengths,
+        )
+        position_ids = position_ids + prefix_offsets
+
+    return position_ids.contiguous()
 
 
 class FusedRopeKVCachePrefillOpBase:
@@ -51,14 +87,21 @@ class FusedRopeKVCachePrefillOpBase:
             kv_cache_offset = None
         kv_cache_offset_h = None # not used
 
+        cp_position_ids = None
         position_ids = attn_inputs.combo_position_ids
         if attn_inputs.context_parallel_info is not None:
-            position_ids = attn_inputs.context_parallel_info.prefill_shuffle_indices
+            cp_position_ids = attn_inputs.context_parallel_info.prefill_shuffle_indices
+            position_ids = None
+        else:
+            fused_position_ids = _make_prefill_position_ids(attn_inputs)
+            if fused_position_ids is not None:
+                position_ids = fused_position_ids
 
         return FusedRopeAttnParams(
             kv_cache_offset,
             kv_cache_offset_h,
             attn_inputs.padding_offset,
+            cp_position_ids,
             position_ids,
             attn_inputs.cu_seqlens,
             attn_inputs.cu_kv_seqlens,
@@ -83,10 +126,18 @@ class FusedRopeKVCachePrefillOpBase:
         store_qkv: bool,
         store_qkv_fp8: bool,
         use_paged_fmha: bool,
+        skip_rope: bool = False,
     ) -> torch.Tensor:
         store_cache = kv_cache is not None
         rope_config = self.attn_configs.rope_config
-        rope_cache = get_rope_cache_once(rope_config, self.attn_configs.max_seq_len)
+        rope_cache = None
+        rope_style = rope_config.style
+        rope_dim = rope_config.dim
+        if skip_rope:
+            rope_style = 0
+            rope_dim = 0
+        else:
+            rope_cache = get_rope_cache_once(rope_config, self.attn_configs.max_seq_len)
 
         return prefill_fused_rope_kvcache(
             qkv,
@@ -109,13 +160,20 @@ class FusedRopeKVCachePrefillOpBase:
             kv_cache_offset=params.kv_cache_offset,
             kv_cache_offset_h=params.kv_cache_offset_h,
             rope_cache=(
-                rope_cache.data if check_rope_cache(rope_config, rope_cache) else None
+                None
+                if skip_rope
+                else (
+                    rope_cache.data
+                    if check_rope_cache(rope_config, rope_cache)
+                    else None
+                )
             ),
             padding_offset=params.padding_offset,
+            cp_position_ids=params.cp_position_ids,
             position_ids=params.position_ids,
             use_logn_attn=self.attn_configs.use_logn_attn,
-            rope_style=rope_config.style,
-            rope_dim=rope_config.dim,
+            rope_style=rope_style,
+            rope_dim=rope_dim,
             rope_base=rope_config.base,
             rope_scale=rope_config.scale,
             rope_beta_slow=rope_config.factor1,
@@ -138,6 +196,7 @@ class FusedRopeKVCachePrefillOpBase:
         qkv: torch.Tensor,
         kv_cache: Optional[LayerKVCache],
         params: FusedRopeAttnParams,
+        skip_rope: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError()
 
@@ -148,9 +207,10 @@ class FusedRopeKVCachePrefillOpQKVOut(FusedRopeKVCachePrefillOpBase):
         qkv: torch.Tensor,
         kv_cache: Optional[LayerKVCache],
         params: FusedRopeAttnParams,
+        skip_rope: bool = False,
     ) -> torch.Tensor:
         return self._forward(
-            qkv, kv_cache, params, False, False, False, True, False, False
+            qkv, kv_cache, params, False, False, False, True, False, False, skip_rope
         )
 
 
@@ -160,11 +220,12 @@ class FusedRopeKVCachePrefillOpQOut(FusedRopeKVCachePrefillOpBase):
         qkv: torch.Tensor,
         kv_cache: Optional[LayerKVCache],
         params: FusedRopeAttnParams,
+        skip_rope: bool = False,
     ) -> torch.Tensor:
         use_paged_fmha = kv_cache is not None and params.max_prefix_length > 0
 
         return self._forward(
-            qkv, kv_cache, params, True, False, False, False, False, use_paged_fmha
+            qkv, kv_cache, params, True, False, False, False, False, use_paged_fmha, skip_rope
         )
 
 
@@ -251,6 +312,7 @@ class FusedRopeKVCacheDecodeOp:
             kv_cache_offset,
             kv_cache_offset_h,
             attn_inputs.padding_offset,
+            None,
             attn_inputs.combo_position_ids,
             attn_inputs.cu_seqlens,
             attn_inputs.cu_kv_seqlens,

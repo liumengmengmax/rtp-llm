@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import grpc
@@ -16,6 +17,10 @@ from rtp_llm.models.downstream_modules.utils import create_custom_module
 from rtp_llm.ops import RoleType
 from rtp_llm.server.host_service import HostService, HostServiceArgs
 from rtp_llm.utils.grpc_util import trans_from_tensor
+
+_IDLE_FISH_REUSE_EMBEDDING_GRPC_CHANNEL = os.environ.get(
+    "IDLE_FISH_ENABLE_EMBEDDING_GRPC_CHANNEL_REUSE", ""
+).strip() in ("1", "true", "True")
 
 
 def tensor_pb_to_torch(tensor_pb) -> Optional[torch.Tensor]:
@@ -67,6 +72,31 @@ class EmbeddingEndpoint(object):
         host_args = HostServiceArgs.create_from_env()
         self.host_service = HostService(host_args)
         logging.info(f"embedding endpoint grpc options: {self.options}")
+        self.reuse_grpc_channel = _IDLE_FISH_REUSE_EMBEDDING_GRPC_CHANNEL
+        self._channel = None
+        self._stub = None
+        self._channel_lock = asyncio.Lock()
+        if self.reuse_grpc_channel:
+            logging.info("idlefish embedding endpoint grpc channel reuse enabled")
+
+    async def _get_embedding_stub(self):
+        if self._stub is not None:
+            return self._stub
+        async with self._channel_lock:
+            if self._stub is None:
+                self._channel = grpc.aio.insecure_channel(
+                    self.address, options=self.options
+                )
+                self._stub = pb2_grpc.EmbeddingRpcServiceStub(self._channel)
+        return self._stub
+
+    async def _reset_embedding_stub(self):
+        async with self._channel_lock:
+            channel = self._channel
+            self._channel = None
+            self._stub = None
+        if channel is not None:
+            await channel.close()
 
     async def embedding(
         self, request: Dict[str, Any]
@@ -96,8 +126,12 @@ class EmbeddingEndpoint(object):
     async def generate_embeddings_grpc(
         self, input: EngineInputs, output: EngineOutputs
     ):
-        channel = grpc.aio.insecure_channel(self.address, options=self.options)
-        stub = pb2_grpc.EmbeddingRpcServiceStub(channel)
+        channel = None
+        if self.reuse_grpc_channel:
+            stub = await self._get_embedding_stub()
+        else:
+            channel = grpc.aio.insecure_channel(self.address, options=self.options)
+            stub = pb2_grpc.EmbeddingRpcServiceStub(channel)
         multimodal_features = []
 
         vit_role_addr = ""
@@ -135,7 +169,19 @@ class EmbeddingEndpoint(object):
             vit_role_addr=vit_role_addr,
         )
         try:
-            response = await stub.embedding(request)
+            try:
+                response = await stub.embedding(request)
+            except grpc.RpcError as e:
+                if self.reuse_grpc_channel and e.code() == grpc.StatusCode.UNAVAILABLE:
+                    logging.warning(
+                        "embedding grpc channel unavailable, reset and retry once"
+                    )
+                    await self._reset_embedding_stub()
+                    await asyncio.sleep(0.2)
+                    stub = await self._get_embedding_stub()
+                    response = await stub.embedding(request)
+                else:
+                    raise
             if response.output_is_tensor:
                 tensor_pb = response.output_t
                 result = tensor_pb_to_torch(tensor_pb)
@@ -154,4 +200,5 @@ class EmbeddingEndpoint(object):
             logging.warning(f"RPC failed: {e.code()}: {e.details()}")
             raise
         finally:
-            await channel.close()
+            if channel is not None:
+                await channel.close()

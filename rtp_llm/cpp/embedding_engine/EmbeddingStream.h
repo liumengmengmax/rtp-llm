@@ -52,6 +52,10 @@ public:
     absl::Status initKVCache(const ResourceContext& resource_context, const ModelConfig& model_config);
     void         releaseKVCache(bool insert_to_cache);
 
+    void setKeepKVCacheOnFinish(bool keep) {
+        keep_kv_cache_on_finish_ = keep;
+    }
+
     bool hasKVCache() const {
         return kv_cache_enabled_;
     }
@@ -100,18 +104,21 @@ protected:
     size_t                           wait_time_us_     = 0;
     kmonitor::MetricsReporterPtr     metrics_reporter_ = nullptr;
     std::optional<torch::Tensor>     context_position_ids_;
-    std::shared_ptr<KVCacheManager>   cache_manager_;
-    BatchKVCacheResourcePtr           batch_kv_cache_resource_;
-    CompleteTokenIdsPtr               complete_token_ids_;
-    bool                              kv_cache_enabled_    = false;
-    bool                              kv_cache_released_   = true;
-    bool                              reuse_cache_         = false;
-    bool                              enable_device_cache_ = true;
-    int64_t                           prefix_length_       = 0;
-    int64_t                           local_reuse_length_  = 0;
+    std::shared_ptr<KVCacheManager>  cache_manager_;
+    BatchKVCacheResourcePtr          batch_kv_cache_resource_;
+    CompleteTokenIdsPtr              complete_token_ids_;
+    bool                             kv_cache_enabled_        = false;
+    bool                             kv_cache_released_       = true;
+    bool                             reuse_cache_             = false;
+    bool                             enable_device_cache_     = true;
+    bool                             keep_kv_cache_on_finish_ = false;
+    int64_t                          prefix_length_           = 0;
+    int64_t                          local_reuse_length_      = 0;
 
-    void reportMetrics();
-    bool supportKVCache() const;
+    void         reportMetrics();
+    bool         supportKVCache() const;
+    bool         matchEmbeddingPrefixCache(const ResourceContext& resource_context) const;
+    absl::Status initEmbeddingPrefixKVCache(const ResourceContext& resource_context, const ModelConfig& model_config);
 };
 
 typedef std::shared_ptr<EmbeddingStream> EmbeddingStreamPtr;

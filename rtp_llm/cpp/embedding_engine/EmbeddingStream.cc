@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include <memory>
 
 using namespace std;
@@ -63,6 +64,104 @@ int64_t EmbeddingStream::inputLength() const {
     return embedding_input_->total_length;
 }
 
+bool EmbeddingStream::matchEmbeddingPrefixCache(const ResourceContext& resource_context) const {
+    const auto& prefix_cache = resource_context.embedding_prefix_cache;
+    if (!prefix_cache || !prefix_cache->enabled || !prefix_cache->ready || prefix_cache->tokens.empty()) {
+        return false;
+    }
+    if (!supportKVCache()) {
+        return false;
+    }
+    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
+    if (inputLength() <= prefix_len || embedding_input_->token_ids.numel() < prefix_len) {
+        return false;
+    }
+
+    const auto* token_ids = embedding_input_->token_ids.data_ptr<int32_t>();
+    for (int64_t i = 0; i < prefix_len; ++i) {
+        if (token_ids[i] != prefix_cache->tokens[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+absl::Status EmbeddingStream::initEmbeddingPrefixKVCache(const ResourceContext& resource_context,
+                                                         const ModelConfig&     model_config) {
+    RTP_LLM_PROFILE_FUNCTION();
+    const auto& prefix_cache = resource_context.embedding_prefix_cache;
+    RTP_LLM_CHECK(prefix_cache && prefix_cache->ready && prefix_cache->kv_cache_resource);
+
+    cache_manager_           = resource_context.cache_manager;
+    reuse_cache_             = false;  // resident prefix is explicit; avoid polluting the block-hash cache per request.
+    enable_device_cache_     = false;
+    batch_kv_cache_resource_ = std::make_shared<BatchKVCacheResource>();
+
+    const auto& cache_config = cache_manager_->cacheConfig();
+    if (cache_config.groupNums() != 1) {
+        return absl::UnimplementedError("embedding prefix cache currently supports a single KV cache group");
+    }
+
+    const size_t kernel_blocks_per_kv_block = cache_config.kernelBlocksPerKvBlock();
+    batch_kv_cache_resource_->resetBatchSize(1);
+    batch_kv_cache_resource_->initGroups(cache_config.groupNums(),
+                                         static_cast<int>(cache_config.layer_all_num),
+                                         cache_config.layer_to_group_id,
+                                         kernel_blocks_per_kv_block,
+                                         cache_config.group_types);
+
+    auto generate_input             = std::make_shared<GenerateInput>();
+    generate_input->request_id      = streamId();
+    generate_input->generate_config = std::make_shared<GenerateConfig>();
+    generate_input->input_ids       = embedding_input_->token_ids;
+    complete_token_ids_             = std::make_shared<CompleteTokenIds>(
+        1, 1, static_cast<int>(model_config.max_seq_len), static_cast<int>(cache_config.seq_size_per_block));
+    complete_token_ids_->init(generate_input);
+
+    MallocInfo malloc_info;
+    malloc_info.batch_kv_cache_resource      = batch_kv_cache_resource_;
+    malloc_info.complete_token_ids           = complete_token_ids_;
+    malloc_info.request_id                   = streamId();
+    malloc_info.reuse_cache                  = false;
+    malloc_info.enable_device_cache          = false;
+    malloc_info.enable_remove_skipped_blocks = false;
+
+    const auto result = cache_manager_->malloc(malloc_info);
+    if (!result.success) {
+        batch_kv_cache_resource_->clearBlocks();
+        complete_token_ids_.reset();
+        return absl::InternalError("embedding prefix kv cache malloc failed");
+    }
+    kv_cache_enabled_  = true;
+    kv_cache_released_ = false;
+
+    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
+    const size_t  prefix_blocks =
+        (static_cast<size_t>(prefix_len) + cache_config.seq_size_per_block - 1) / cache_config.seq_size_per_block;
+    const auto& src_blocks = prefix_cache->kv_cache_resource->blocks(0, 0);
+    const auto& dst_blocks = batch_kv_cache_resource_->blocks(0, 0);
+    if (src_blocks.size() < prefix_blocks || dst_blocks.size() < prefix_blocks) {
+        releaseKVCache(false);
+        return absl::InternalError("embedding prefix kv cache block count mismatch");
+    }
+
+    std::vector<BlockIdPair> copy_mapping;
+    copy_mapping.reserve(prefix_blocks);
+    for (size_t i = 0; i < prefix_blocks; ++i) {
+        copy_mapping.push_back(BlockIdPair{src_blocks[i], dst_blocks[i]});
+    }
+    cache_manager_->blockBatchCopy(copy_mapping);
+
+    prefix_length_      = prefix_len;
+    local_reuse_length_ = prefix_len;
+    RTP_LLM_LOG_DEBUG("embedding stream [%ld] init resident prefix kv cache, prefix=%ld, blocks=%zu/%d",
+                      streamId(),
+                      prefix_length_,
+                      prefix_blocks,
+                      batch_kv_cache_resource_->curBlocksNum());
+    return absl::OkStatus();
+}
+
 absl::Status EmbeddingStream::initKVCache(const ResourceContext& resource_context, const ModelConfig& model_config) {
     RTP_LLM_PROFILE_FUNCTION();
     if (kv_cache_enabled_ || !resource_context.cache_manager || !resource_context.reuse_cache) {
@@ -71,13 +170,16 @@ absl::Status EmbeddingStream::initKVCache(const ResourceContext& resource_contex
     if (!supportKVCache()) {
         return absl::OkStatus();
     }
+    if (matchEmbeddingPrefixCache(resource_context)) {
+        return initEmbeddingPrefixKVCache(resource_context, model_config);
+    }
 
     cache_manager_           = resource_context.cache_manager;
     reuse_cache_             = resource_context.reuse_cache;
     enable_device_cache_     = resource_context.enable_device_cache;
     batch_kv_cache_resource_ = std::make_shared<BatchKVCacheResource>();
 
-    const auto& cache_config = cache_manager_->cacheConfig();
+    const auto& cache_config               = cache_manager_->cacheConfig();
     size_t      kernel_blocks_per_kv_block = cache_config.kernelBlocksPerKvBlock();
     batch_kv_cache_resource_->resetBatchSize(1);
     batch_kv_cache_resource_->initGroups(cache_config.groupNums(),
@@ -90,10 +192,8 @@ absl::Status EmbeddingStream::initKVCache(const ResourceContext& resource_contex
     generate_input->request_id      = streamId();
     generate_input->generate_config = std::make_shared<GenerateConfig>();
     generate_input->input_ids       = embedding_input_->token_ids;
-    complete_token_ids_ = std::make_shared<CompleteTokenIds>(1,
-                                                             1,
-                                                             static_cast<int>(model_config.max_seq_len),
-                                                             static_cast<int>(cache_config.seq_size_per_block));
+    complete_token_ids_             = std::make_shared<CompleteTokenIds>(
+        1, 1, static_cast<int>(model_config.max_seq_len), static_cast<int>(cache_config.seq_size_per_block));
     complete_token_ids_->init(generate_input);
 
     MallocInfo malloc_info;
@@ -147,9 +247,9 @@ void EmbeddingStream::releaseKVCache(bool insert_to_cache) {
         cache_manager_->free(free_info);
     }
     batch_kv_cache_resource_->clearBlocks();
-    kv_cache_released_  = true;
-    kv_cache_enabled_   = false;
-    prefix_length_      = 0;
+    kv_cache_released_ = true;
+    kv_cache_enabled_  = false;
+    prefix_length_     = 0;
     if (!insert_to_cache) {
         local_reuse_length_ = 0;
     }
@@ -192,7 +292,9 @@ void EmbeddingStream::setStart() {
 }
 
 void EmbeddingStream::updateTensorOutput(torch::Tensor t) {
-    releaseKVCache(true);
+    if (!keep_kv_cache_on_finish_) {
+        releaseKVCache(true);
+    }
     lock_guard<mutex> lock(lock_);
     embedding_output_->setTensorOutput(t);
     stream_state_ = StreamState::FINISHED;
@@ -201,7 +303,9 @@ void EmbeddingStream::updateTensorOutput(torch::Tensor t) {
 }
 
 void EmbeddingStream::updateMapOutput(std::vector<std::map<std::string, torch::Tensor>>& map) {
-    releaseKVCache(true);
+    if (!keep_kv_cache_on_finish_) {
+        releaseKVCache(true);
+    }
     lock_guard<mutex> lock(lock_);
     embedding_output_->setMapOutput(map);
     stream_state_ = StreamState::FINISHED;
