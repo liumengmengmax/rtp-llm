@@ -23,8 +23,13 @@ public:
     forward(const torch::Tensor& input, std::optional<torch_ext::LayerKVCache> kv_cache, const TRTAttnPtr& params) = 0;
 
 protected:
+    torch::Tensor getTiledCounter(const torch::Tensor& input);
+    torch::Tensor getFmhaOutputBuffer(const torch::Tensor& input, int64_t rows, int64_t cols);
+
     std::shared_ptr<TrtV2FmhaRunner> trt_v2_runner_;
     torch::Tensor                    static_scale_;
+    torch::Tensor                    tiled_counter_;
+    torch::Tensor                    fmha_output_;
     AttentionConfigs                 attn_configs_;
 };
 

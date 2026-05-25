@@ -177,6 +177,7 @@ cc_library(
         "//rtp_llm/models_py/bindings/cuda/kernels:gather_add_rmsnorm",
         "//rtp_llm/models_py/bindings/cuda/kernels:idlefish_mlp_l2norm",
         "//rtp_llm/models_py/bindings/cuda/kernels:l2norm",
+        "//rtp_llm/models_py/bindings/cuda/kernels:fused_qk_norm_rope",
         "//rtp_llm/models_py/bindings/cuda/kernels:mla_quant_kernel",
         "//rtp_llm/models_py/bindings:op_defs",
         "//rtp_llm/models_py/bindings/common:common",

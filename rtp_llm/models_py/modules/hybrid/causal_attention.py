@@ -84,7 +84,13 @@ class CausalAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         qkv = self.qkv_proj(hidden_states)
         if self.qk_fuse_norm is not None:
-            qkv = self.qk_fuse_norm(qkv)
+            forward_with_fused_rope = getattr(
+                self.qk_fuse_norm, "forward_with_fused_rope", None
+            )
+            if forward_with_fused_rope is not None:
+                qkv = forward_with_fused_rope(qkv, fmha_impl)
+            else:
+                qkv = self.qk_fuse_norm(qkv)
         attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if gate is not None:
