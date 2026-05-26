@@ -115,10 +115,12 @@ protected:
     int64_t                          prefix_length_           = 0;
     int64_t                          local_reuse_length_      = 0;
 
-    void         reportMetrics();
-    bool         supportKVCache() const;
-    bool         matchEmbeddingPrefixCache(const ResourceContext& resource_context) const;
-    absl::Status initEmbeddingPrefixKVCache(const ResourceContext& resource_context, const ModelConfig& model_config);
+    void                             reportMetrics();
+    bool                             supportKVCache() const;
+    const EmbeddingPrefixCacheEntry* matchEmbeddingPrefixCache(const ResourceContext& resource_context) const;
+    absl::Status                     initEmbeddingPrefixKVCache(const ResourceContext&           resource_context,
+                                                                const ModelConfig&               model_config,
+                                                                const EmbeddingPrefixCacheEntry& entry);
 };
 
 typedef std::shared_ptr<EmbeddingStream> EmbeddingStreamPtr;

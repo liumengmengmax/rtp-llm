@@ -9,11 +9,9 @@
 #include "autil/EnvUtil.h"
 #include <c10/core/InferenceMode.h>
 #include <algorithm>
-#include <cctype>
 #include <exception>
 #include <limits>
 #include <list>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -39,7 +37,7 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     warmupNoBlockCopy();
     resource_context_.initCacheConfig(
         params.kv_cache_config, params.runtime_config.fifo_scheduler_config, params.model_config_.max_seq_len);
-    initEmbeddingPrefixCacheConfig();
+    initEmbeddingPrefixCacheConfig(params);
     initCacheManager(params);
     executor_.reset(
         new EmbeddingExecutor(params, handler, resource_context_, kv_cache_group_num_, kv_cache_layer_to_group_));
@@ -50,57 +48,50 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     (void)startLoop();
 }
 
-namespace {
-
-std::vector<int32_t> parseEmbeddingPrefixTokens(const std::string& raw_tokens) {
-    std::string normalized;
-    normalized.reserve(raw_tokens.size());
-    for (char ch : raw_tokens) {
-        normalized.push_back((ch == ',' || ch == '[' || ch == ']') ? ' ' : ch);
-    }
-
-    std::vector<int32_t> tokens;
-    std::stringstream    ss(normalized);
-    long long            value = 0;
-    while (ss >> value) {
-        RTP_LLM_CHECK_WITH_INFO(value >= 0 && value <= std::numeric_limits<int32_t>::max(),
-                                "invalid embedding prefix token id: %lld",
-                                value);
-        tokens.push_back(static_cast<int32_t>(value));
-    }
-    return tokens;
-}
-
-}  // namespace
-
-void EmbeddingEngine::initEmbeddingPrefixCacheConfig() {
-    const bool enable_prefix_cache = autil::EnvUtil::getEnv("IDLE_FISH_ENABLE_EMBEDDING_PREFIX_CACHE", false);
-    if (!enable_prefix_cache) {
+void EmbeddingEngine::initEmbeddingPrefixCacheConfig(const EngineInitParams& params) {
+    const auto& multi_task_prompt_tokens = params.kv_cache_config.multi_task_prompt_tokens;
+    if (multi_task_prompt_tokens.empty()) {
         return;
     }
     const bool supports_embedding_cache = model_config_.model_type == "qwen_3_idle_fish_embedding"
                                           && model_config_.task_type == TaskType::DENSE_EMBEDDING
                                           && model_config_.attn_config.is_causal;
     if (!supports_embedding_cache) {
-        RTP_LLM_LOG_WARNING("embedding resident prefix cache ignored for model_type=%s task_type=%d is_causal=%d",
+        RTP_LLM_LOG_WARNING("embedding resident prefix cache from MULTI_TASK_PROMPT_STR ignored for "
+                            "model_type=%s task_type=%d is_causal=%d",
                             model_config_.model_type.c_str(),
                             static_cast<int>(model_config_.task_type),
                             static_cast<int>(model_config_.attn_config.is_causal));
         return;
     }
 
-    const std::string raw_tokens = autil::EnvUtil::getEnv("IDLE_FISH_EMBEDDING_PREFIX_CACHE_TOKENS", std::string(""));
-    auto              tokens     = parseEmbeddingPrefixTokens(raw_tokens);
-    RTP_LLM_CHECK_WITH_INFO(!tokens.empty(),
-                            "IDLE_FISH_ENABLE_EMBEDDING_PREFIX_CACHE=1 requires "
-                            "IDLE_FISH_EMBEDDING_PREFIX_CACHE_TOKENS");
-
-    resource_context_.embedding_prefix_cache          = std::make_shared<EmbeddingPrefixCache>();
-    resource_context_.embedding_prefix_cache->enabled = true;
-    resource_context_.embedding_prefix_cache->tokens  = std::move(tokens);
-    resource_context_.reuse_cache                     = true;
-    RTP_LLM_LOG_INFO("embedding resident prefix cache configured with %zu tokens",
-                     resource_context_.embedding_prefix_cache->tokens.size());
+    auto prefix_cache     = std::make_shared<EmbeddingPrefixCache>();
+    prefix_cache->enabled = true;
+    for (const auto& kv : multi_task_prompt_tokens) {
+        const auto& task_id = kv.first;
+        const auto& tokens  = kv.second;
+        if (tokens.empty()) {
+            RTP_LLM_LOG_WARNING("MULTI_TASK_PROMPT_STR task_id=%s has empty token list, skipped", task_id.c_str());
+            continue;
+        }
+        EmbeddingPrefixCacheEntry entry;
+        entry.tokens.reserve(tokens.size());
+        for (int tok : tokens) {
+            RTP_LLM_CHECK_WITH_INFO(tok >= 0 && tok <= std::numeric_limits<int32_t>::max(),
+                                    "MULTI_TASK_PROMPT_STR task_id=%s contains invalid token id %d",
+                                    task_id.c_str(),
+                                    tok);
+            entry.tokens.push_back(static_cast<int32_t>(tok));
+        }
+        prefix_cache->entries.push_back(std::move(entry));
+    }
+    if (prefix_cache->entries.empty()) {
+        return;
+    }
+    resource_context_.embedding_prefix_cache = prefix_cache;
+    resource_context_.reuse_cache            = true;
+    RTP_LLM_LOG_INFO("embedding resident prefix cache configured with %zu prompt(s) from MULTI_TASK_PROMPT_STR",
+                     prefix_cache->entries.size());
 }
 
 absl::Status EmbeddingEngine::buildEmbeddingPrefixCache() {
@@ -112,46 +103,59 @@ absl::Status EmbeddingEngine::buildEmbeddingPrefixCache() {
         return absl::InternalError("embedding resident prefix cache requires cache manager");
     }
 
-    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
-    auto          token_ids =
-        torch::from_blob(prefix_cache->tokens.data(), {prefix_len}, torch::TensorOptions(torch::kInt32)).clone();
-    auto token_type_ids = torch::zeros({prefix_len}, torch::TensorOptions(torch::kInt32));
-    auto input_lengths  = torch::tensor({static_cast<int32_t>(prefix_len)}, torch::TensorOptions(torch::kInt32));
-    auto input          = std::make_shared<EmbeddingInput>(token_ids, token_type_ids, input_lengths, /*request_id=*/-1);
-    auto stream         = std::make_shared<EmbeddingStream>(input);
-    stream->setMetricReporter(metrics_reporter_);
-    stream->setKeepKVCacheOnFinish(true);
+    for (size_t i = 0; i < prefix_cache->entries.size(); ++i) {
+        auto& entry = prefix_cache->entries[i];
+        if (entry.tokens.empty()) {
+            continue;
+        }
+        const int64_t prefix_len = static_cast<int64_t>(entry.tokens.size());
+        auto          token_ids =
+            torch::from_blob(entry.tokens.data(), {prefix_len}, torch::TensorOptions(torch::kInt32)).clone();
+        auto token_type_ids = torch::zeros({prefix_len}, torch::TensorOptions(torch::kInt32));
+        auto input_lengths  = torch::tensor({static_cast<int32_t>(prefix_len)}, torch::TensorOptions(torch::kInt32));
+        auto input          = std::make_shared<EmbeddingInput>(
+            token_ids, token_type_ids, input_lengths, /*request_id=*/-(static_cast<int64_t>(i) + 1));
+        auto stream = std::make_shared<EmbeddingStream>(input);
+        stream->setMetricReporter(metrics_reporter_);
+        stream->setKeepKVCacheOnFinish(true);
 
-    std::list<EmbeddingStreamPtr> streams = {stream};
-    RETURN_IF_STATUS_ERROR(executor_->process(streams));
-    stream->waitFinish();
-    if (!stream->hasKVCache() || !stream->kvCacheResource() || !stream->completeTokenIds()) {
-        return absl::InternalError("embedding resident prefix cache build did not keep kv cache");
+        std::list<EmbeddingStreamPtr> streams = {stream};
+        RETURN_IF_STATUS_ERROR(executor_->process(streams));
+        stream->waitFinish();
+        if (!stream->hasKVCache() || !stream->kvCacheResource() || !stream->completeTokenIds()) {
+            return absl::InternalError("embedding resident prefix cache build did not keep kv cache");
+        }
+
+        entry.kv_cache_resource  = stream->kvCacheResource();
+        entry.complete_token_ids = stream->completeTokenIds();
+        RTP_LLM_LOG_INFO("embedding resident prefix cache built entry[%zu], prefix_tokens=%ld blocks=%d",
+                         i,
+                         prefix_len,
+                         entry.kv_cache_resource->curBlocksNum());
     }
-
-    prefix_cache->kv_cache_resource  = stream->kvCacheResource();
-    prefix_cache->complete_token_ids = stream->completeTokenIds();
-    prefix_cache->ready              = true;
-    RTP_LLM_LOG_INFO("embedding resident prefix cache built, prefix_tokens=%ld blocks=%d",
-                     prefix_len,
-                     prefix_cache->kv_cache_resource->curBlocksNum());
+    prefix_cache->ready = true;
     return absl::OkStatus();
 }
 
 void EmbeddingEngine::releaseEmbeddingPrefixCache() {
     auto& prefix_cache = resource_context_.embedding_prefix_cache;
-    if (!prefix_cache || !prefix_cache->ready || !prefix_cache->kv_cache_resource || !prefix_cache->complete_token_ids
-        || !resource_context_.cache_manager) {
+    if (!prefix_cache || !prefix_cache->ready || !resource_context_.cache_manager) {
         return;
     }
-    if (prefix_cache->kv_cache_resource->curBlocksNum() > 0) {
-        FreeInfo free_info{prefix_cache->kv_cache_resource, prefix_cache->complete_token_ids};
-        free_info.request_id = -1;
-        resource_context_.cache_manager->free(free_info);
+    for (size_t i = 0; i < prefix_cache->entries.size(); ++i) {
+        auto& entry = prefix_cache->entries[i];
+        if (!entry.kv_cache_resource || !entry.complete_token_ids) {
+            continue;
+        }
+        if (entry.kv_cache_resource->curBlocksNum() > 0) {
+            FreeInfo free_info{entry.kv_cache_resource, entry.complete_token_ids};
+            free_info.request_id = -(static_cast<int64_t>(i) + 1);
+            resource_context_.cache_manager->free(free_info);
+        }
+        entry.kv_cache_resource->clearBlocks();
+        entry.kv_cache_resource.reset();
+        entry.complete_token_ids.reset();
     }
-    prefix_cache->kv_cache_resource->clearBlocks();
-    prefix_cache->kv_cache_resource.reset();
-    prefix_cache->complete_token_ids.reset();
     prefix_cache->ready = false;
 }
 

@@ -16,12 +16,16 @@ class GenerateStream;
 class BatchKVCacheResource;
 class CompleteTokenIds;
 
-struct EmbeddingPrefixCache {
-    bool                                  enabled = false;
-    bool                                  ready   = false;
+struct EmbeddingPrefixCacheEntry {
     std::vector<int32_t>                  tokens;
     std::shared_ptr<BatchKVCacheResource> kv_cache_resource;
     std::shared_ptr<CompleteTokenIds>     complete_token_ids;
+};
+
+struct EmbeddingPrefixCache {
+    bool                                   enabled = false;
+    bool                                   ready   = false;
+    std::vector<EmbeddingPrefixCacheEntry> entries;
 };
 
 struct ResourceContext {
