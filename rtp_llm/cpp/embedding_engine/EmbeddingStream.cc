@@ -64,33 +64,52 @@ int64_t EmbeddingStream::inputLength() const {
     return embedding_input_->total_length;
 }
 
-bool EmbeddingStream::matchEmbeddingPrefixCache(const ResourceContext& resource_context) const {
+const EmbeddingPrefixCacheEntry*
+EmbeddingStream::matchEmbeddingPrefixCache(const ResourceContext& resource_context) const {
     const auto& prefix_cache = resource_context.embedding_prefix_cache;
-    if (!prefix_cache || !prefix_cache->enabled || !prefix_cache->ready || prefix_cache->tokens.empty()) {
-        return false;
+    if (!prefix_cache || !prefix_cache->enabled || !prefix_cache->ready || prefix_cache->entries.empty()) {
+        return nullptr;
     }
     if (!supportKVCache()) {
-        return false;
-    }
-    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
-    if (inputLength() <= prefix_len || embedding_input_->token_ids.numel() < prefix_len) {
-        return false;
+        return nullptr;
     }
 
-    const auto* token_ids = embedding_input_->token_ids.data_ptr<int32_t>();
-    for (int64_t i = 0; i < prefix_len; ++i) {
-        if (token_ids[i] != prefix_cache->tokens[i]) {
-            return false;
+    const auto*   token_ids       = embedding_input_->token_ids.data_ptr<int32_t>();
+    const int64_t input_token_num = static_cast<int64_t>(embedding_input_->token_ids.numel());
+
+    const EmbeddingPrefixCacheEntry* best     = nullptr;
+    int64_t                          best_len = 0;
+    for (const auto& entry : prefix_cache->entries) {
+        if (!entry.kv_cache_resource || !entry.complete_token_ids || entry.tokens.empty()) {
+            continue;
+        }
+        const int64_t prefix_len = static_cast<int64_t>(entry.tokens.size());
+        if (prefix_len <= best_len) {
+            continue;
+        }
+        if (inputLength() <= prefix_len || input_token_num < prefix_len) {
+            continue;
+        }
+        bool match = true;
+        for (int64_t i = 0; i < prefix_len; ++i) {
+            if (token_ids[i] != entry.tokens[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            best     = &entry;
+            best_len = prefix_len;
         }
     }
-    return true;
+    return best;
 }
 
-absl::Status EmbeddingStream::initEmbeddingPrefixKVCache(const ResourceContext& resource_context,
-                                                         const ModelConfig&     model_config) {
+absl::Status EmbeddingStream::initEmbeddingPrefixKVCache(const ResourceContext&           resource_context,
+                                                         const ModelConfig&               model_config,
+                                                         const EmbeddingPrefixCacheEntry& entry) {
     RTP_LLM_PROFILE_FUNCTION();
-    const auto& prefix_cache = resource_context.embedding_prefix_cache;
-    RTP_LLM_CHECK(prefix_cache && prefix_cache->ready && prefix_cache->kv_cache_resource);
+    RTP_LLM_CHECK(entry.kv_cache_resource && entry.complete_token_ids && !entry.tokens.empty());
 
     cache_manager_           = resource_context.cache_manager;
     reuse_cache_             = false;  // resident prefix is explicit; avoid polluting the block-hash cache per request.
@@ -135,10 +154,10 @@ absl::Status EmbeddingStream::initEmbeddingPrefixKVCache(const ResourceContext& 
     kv_cache_enabled_  = true;
     kv_cache_released_ = false;
 
-    const int64_t prefix_len = static_cast<int64_t>(prefix_cache->tokens.size());
+    const int64_t prefix_len = static_cast<int64_t>(entry.tokens.size());
     const size_t  prefix_blocks =
         (static_cast<size_t>(prefix_len) + cache_config.seq_size_per_block - 1) / cache_config.seq_size_per_block;
-    const auto& src_blocks = prefix_cache->kv_cache_resource->blocks(0, 0);
+    const auto& src_blocks = entry.kv_cache_resource->blocks(0, 0);
     const auto& dst_blocks = batch_kv_cache_resource_->blocks(0, 0);
     if (src_blocks.size() < prefix_blocks || dst_blocks.size() < prefix_blocks) {
         releaseKVCache(false);
@@ -154,11 +173,11 @@ absl::Status EmbeddingStream::initEmbeddingPrefixKVCache(const ResourceContext& 
 
     prefix_length_      = prefix_len;
     local_reuse_length_ = prefix_len;
-    RTP_LLM_LOG_DEBUG("embedding stream [%ld] init resident prefix kv cache, prefix=%ld, blocks=%zu/%d",
-                      streamId(),
-                      prefix_length_,
-                      prefix_blocks,
-                      batch_kv_cache_resource_->curBlocksNum());
+    RTP_LLM_LOG_INFO("embedding stream [%ld] init resident prefix kv cache, prefix=%ld, blocks=%zu/%d",
+                     streamId(),
+                     prefix_length_,
+                     prefix_blocks,
+                     batch_kv_cache_resource_->curBlocksNum());
     return absl::OkStatus();
 }
 
@@ -170,8 +189,8 @@ absl::Status EmbeddingStream::initKVCache(const ResourceContext& resource_contex
     if (!supportKVCache()) {
         return absl::OkStatus();
     }
-    if (matchEmbeddingPrefixCache(resource_context)) {
-        return initEmbeddingPrefixKVCache(resource_context, model_config);
+    if (const auto* matched_entry = matchEmbeddingPrefixCache(resource_context)) {
+        return initEmbeddingPrefixKVCache(resource_context, model_config, *matched_entry);
     }
 
     cache_manager_           = resource_context.cache_manager;

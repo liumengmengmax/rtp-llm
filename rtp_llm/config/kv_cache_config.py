@@ -37,11 +37,18 @@ class KVCacheConfig(CppKVCacheConfig):
 
         # Update task prompt tokens if tokenizer is provided
         if tokenizer and multi_task_prompt_config:
+            # The default tokenizer.encode(prompt) uses add_special_tokens=True and
+            # appends a trailing special token (e.g. <|endoftext|> for Qwen).
+            # Request user-text never carries that token, so leaving it in would
+            # break exact-prefix matching for the embedding resident prefix cache
+            # (and inject a spurious special token between system prompt and user
+            # input on NormalEngine's task_id prepend path). Encode with
+            # add_special_tokens=False to record exactly the prompt's user-text tokens.
             if isinstance(multi_task_prompt_config, list):
                 for info in multi_task_prompt_config:
                     task_id: str = str(info["task_id"])
                     prompt: str = info["prompt"]
-                    tokens_id = tokenizer.encode(prompt)
+                    tokens_id = tokenizer.encode(prompt, add_special_tokens=False)
                     self.insertMultiTaskPromptTokens(task_id, tokens_id)
 
         if self.multi_task_prompt_tokens:

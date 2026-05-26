@@ -56,7 +56,7 @@ private:
     absl::Status trySaveStepError() const;
     void         loop();
     void         initCacheManager(const EngineInitParams& params);
-    void         initEmbeddingPrefixCacheConfig();
+    void         initEmbeddingPrefixCacheConfig(const EngineInitParams& params);
     absl::Status buildEmbeddingPrefixCache();
     void         releaseEmbeddingPrefixCache();
 
