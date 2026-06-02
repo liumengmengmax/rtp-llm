@@ -268,30 +268,9 @@ absl::Status EmbeddingEngine::step() {
         RTP_LLM_LOG_INFO("no query run and sleep");
         return absl::OkStatus();
     }
-    // If gen_timeline_sync is enabled and no profiling session is currently active,
-    // configure + tick BEFORE process() to start the profiler before the actual work runs.
-    // After process(), tick() again to count this step. When the step count reaches num_steps,
-    // the profiler auto-stops and saves the JSON file. The next step() will start a new window.
-    //
-    // Window parameters mirror the NormalEngine (LLM) control surface, but since
-    // EmbeddingEngine has no per-stream `generateConfig` to source them from, we expose them
-    // as environment variables (sharing the GEN_TIMELINE_* prefix with the existing SYNC flag):
-    //
-    //   GEN_TIMELINE_SYNC        -> ProfilingDebugLoggingConfig.gen_timeline_sync (master switch)
-    //   GEN_TIMELINE_TRACE_NAME  -> trace prefix for the JSON filename (default: embedding_timeline)
-    //   GEN_TIMELINE_START_STEP  -> warm-up steps to skip before starting the profiler  (default: 0)
-    //   GEN_TIMELINE_NUM_STEPS   -> how many steps to capture before stop+flush          (default: 1)
-    //
-    // For embedding models each step() runs one complete forward pass (unlike NormalEngine
-    // where a single request spans many decode steps). One step is usually sufficient to
-    // capture a representative trace, so num_steps defaults to 1 to ensure the JSON is
-    // flushed even if the server is torn down right after a single query (e.g. on a
-    // smoke-test failure path).
+    // EmbeddingEngine has no per-stream generateConfig, so the profiling window is sourced
+    // from env vars: GEN_TIMELINE_TRACE_NAME / GEN_TIMELINE_START_STEP / GEN_TIMELINE_NUM_STEPS.
     if (profiling_debug_logging_config_.gen_timeline_sync && !step_profiler_.enabled()) {
-        // Read profiling window parameters via the project-standard EnvUtil helper
-        // (same pattern as PERF_TEST in GenerateStream.cc, BIZ_NAME / CHECKPOINT_PATH in
-        // RemoteConnector.cc, FT_SERVER_TEST in Logger.cc, etc.). The template overload
-        // dispatches on the default-value type: std::string / int / bool.
         const std::string trace_name =
             autil::EnvUtil::getEnv("GEN_TIMELINE_TRACE_NAME", std::string("embedding_timeline"));
         const int start_step = std::max(0, autil::EnvUtil::getEnv("GEN_TIMELINE_START_STEP", 0));
@@ -301,7 +280,7 @@ absl::Status EmbeddingEngine::step() {
                          start_step,
                          num_steps);
         step_profiler_.configure(true, trace_name, start_step, num_steps);
-        step_profiler_.tick();  // tick once now so start_step counting begins immediately
+        step_profiler_.tick();
     }
     try {
         auto status = executor_->process(streams);
@@ -324,7 +303,6 @@ absl::Status EmbeddingEngine::step() {
             abort();
         }
     }
-    // tick profiler after process() to count this step (and stop when num_steps reached).
     step_profiler_.tick();
     cudaSyncAndCheck();
     return absl::OkStatus();

@@ -46,19 +46,6 @@ cc_library(
 )
 
 cc_library(
-    name = "fused_qk_norm_rope",
-    srcs = ["fused_qk_norm_rope.cu"],
-    hdrs = ["fused_qk_norm_rope.h"],
-    deps = cuda_deps + [
-        "//rtp_llm/cpp/utils:core_utils",
-        "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
-        "//rtp_llm/models_py/bindings/cuda:launch_utils",
-    ],
-    copts = any_cuda_copts(),
-    visibility = ["//visibility:public"],
-)
-
-cc_library(
     name = "cuda_no_aux_tc",
     srcs = ["no_aux_tc_kernels.cu"],
     hdrs = ["no_aux_tc_kernels.h"],
@@ -205,7 +192,6 @@ cc_library(
         ":l2norm",
         ":gather_add_rmsnorm",
         ":idlefish_mlp_l2norm",
-        ":fused_qk_norm_rope",
         ":mla_quant_kernel",
     ],
     visibility = ["//visibility:public"],
