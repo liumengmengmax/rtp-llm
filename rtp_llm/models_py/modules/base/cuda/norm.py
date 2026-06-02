@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple
 
 import flashinfer
@@ -33,7 +32,9 @@ class RMSResNorm(BaseResNorm):
     def __init__(self, weight: torch.Tensor, eps: float = 1e-6):
         super().__init__(weight, eps)
 
-    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor):
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
         stream_id = torch.cuda.current_stream().cuda_stream
         rtp_llm_ops.fused_add_rmsnorm(
             hidden_states, residual, self.weight.data, self.variance_epsilon, stream_id
@@ -100,30 +101,10 @@ class FusedQKRMSNorm(nn.Module):
         self.q_size = self.head_num * self.size_per_head
         self.kv_size = self.kv_head_num * self.size_per_head
         self.enable_pdl = enable_pdl
-        self.use_rtp_fused_qk_norm = (
-            os.environ.get("IDLE_FISH_ENABLE_RTP_FUSED_QK_RMSNORM", "0") == "1"
-        )
-        self.use_fused_qk_norm_rope = (
-            os.environ.get("IDLE_FISH_ENABLE_FUSED_QK_NORM_ROPE", "0") == "1"
-            or os.environ.get("IDLE_FISH_ENABLE_FUSED_QK_NORM_ROPE_CACHE", "0") == "1"
-        )
 
     def forward(self, hidden_states: torch.Tensor):
         assert hidden_states.dim() == 2
         m, n = hidden_states.shape
-        if self.use_rtp_fused_qk_norm:
-            rtp_llm_ops.fused_qk_rmsnorm(
-                hidden_states,
-                self.q_weight,
-                self.k_weight,
-                self.eps,
-                self.head_num,
-                self.kv_head_num,
-                m,
-                n,
-                self.size_per_head,
-            )
-            return hidden_states
         qkv = hidden_states.reshape(
             m, (self.head_num + self.kv_head_num * 2), self.size_per_head
         )
@@ -136,19 +117,6 @@ class FusedQKRMSNorm(nn.Module):
             k, self.k_weight, eps=self.eps, out=k, enable_pdl=self.enable_pdl
         )
         return qkv.reshape(m, n)
-
-    def forward_with_fused_rope(
-        self, hidden_states: torch.Tensor, fmha_impl
-    ) -> torch.Tensor:
-        if self.use_fused_qk_norm_rope:
-            apply_fused_qk_norm_rope = getattr(
-                fmha_impl, "apply_fused_qk_norm_rope", None
-            )
-            if apply_fused_qk_norm_rope is not None and apply_fused_qk_norm_rope(
-                hidden_states, self.q_weight, self.k_weight, self.eps
-            ):
-                return hidden_states
-        return self.forward(hidden_states)
 
 
 class AddBiasResLayerNorm(BaseAddBiasResLayerNorm):

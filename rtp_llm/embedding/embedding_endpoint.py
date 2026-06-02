@@ -15,9 +15,9 @@ from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
 from rtp_llm.models.downstream_modules.utils import create_custom_module
 
-_IDLE_FISH_REUSE_EMBEDDING_GRPC_CHANNEL = os.environ.get(
-    "IDLE_FISH_ENABLE_EMBEDDING_GRPC_CHANNEL_REUSE", ""
-).strip() in ("1", "true", "True")
+_IDLE_FISH_REUSE_EMBEDDING_GRPC_CHANNEL = (
+    os.environ.get("IDLE_FISH_ENABLE_EMBEDDING_GRPC_CHANNEL_REUSE", "0") == "1"
+)
 
 
 def tensor_pb_to_torch(tensor_pb) -> Optional[torch.Tensor]:

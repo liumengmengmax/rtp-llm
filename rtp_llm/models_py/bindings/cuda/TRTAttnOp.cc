@@ -6,55 +6,12 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cstdlib>
-#include <cstring>
 
 using namespace torch_ext;
 
 namespace rtp_llm {
 
 TRTPrefillOpBase::TRTPrefillOpBase(const AttentionConfigs& attn_configs): attn_configs_(attn_configs) {}
-
-namespace {
-
-bool reuseTrtFmhaCounterEnabled() {
-    const char* value = std::getenv("IDLE_FISH_ENABLE_REUSE_TRT_FMHA_COUNTER");
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-bool reuseTrtFmhaOutputEnabled() {
-    const char* value = std::getenv("IDLE_FISH_ENABLE_REUSE_TRT_FMHA_OUTPUT");
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-}  // namespace
-
-torch::Tensor TRTPrefillOpBase::getTiledCounter(const torch::Tensor& input) {
-    auto options = torch::TensorOptions(torch::kUInt32).device(input.device());
-    if (!reuseTrtFmhaCounterEnabled()) {
-        return torch::zeros({1}, options);
-    }
-
-    if (!tiled_counter_.defined() || tiled_counter_.get_device() != input.get_device()) {
-        tiled_counter_ = torch::empty({1}, options);
-    }
-    check_cuda_value(cudaMemsetAsync(tiled_counter_.data_ptr(), 0, sizeof(uint32_t), GET_CURRENT_STREAM()));
-    return tiled_counter_;
-}
-
-torch::Tensor TRTPrefillOpBase::getFmhaOutputBuffer(const torch::Tensor& input, int64_t rows, int64_t cols) {
-    auto options = torch::TensorOptions(input.dtype()).device(input.device());
-    if (!reuseTrtFmhaOutputEnabled()) {
-        return torch::empty({rows, cols}, options);
-    }
-
-    if (!fmha_output_.defined() || fmha_output_.get_device() != input.get_device()
-        || fmha_output_.scalar_type() != input.scalar_type() || fmha_output_.size(0) != rows
-        || fmha_output_.size(1) != cols) {
-        fmha_output_ = torch::empty({rows, cols}, options);
-    }
-    return fmha_output_;
-}
 
 bool TRTPrefillOpBase::support(torch_ext::PyAttentionInputs attn_inputs) {
     // FMHAConfig check will be done in Python layer
@@ -151,7 +108,7 @@ torch::Tensor TRTPagedPrefillOp::forward(const torch::Tensor&                   
     torch::TensorOptions options    = torch::TensorOptions(input.dtype()).device(input.device());
 
     torch::Tensor output        = torch::zeros({token_num, local_head_num * size_per_head}, options);
-    torch::Tensor tiled_counter = getTiledCounter(input);
+    torch::Tensor tiled_counter = torch::zeros({1}, torch::TensorOptions(torch::kUInt32).device(input.device()));
     bool          use_fp8_fmha  = kv_block_array.cache_type == KvCacheDataType::FP8;
     float*        attention_output_orig_quant_scale = use_fp8_fmha ? static_scale_.data_ptr<float>() : nullptr;
 
@@ -203,13 +160,14 @@ torch::Tensor TRTNormalPrefillOp::forward(const torch::Tensor&                  
         }
     }
 
-    const int local_head_num = attn_configs_.head_num;
-    const int size_per_head  = attn_configs_.size_per_head;
-    const int token_num      = input.size(0);
-    const int batch_size     = params->input_lengths.size(0);
+    const int            local_head_num = attn_configs_.head_num;
+    const int            size_per_head  = attn_configs_.size_per_head;
+    const int            token_num      = input.size(0);
+    const int            batch_size     = params->input_lengths.size(0);
+    torch::TensorOptions options        = torch::TensorOptions(input.dtype()).device(input.device());
 
-    torch::Tensor output        = getFmhaOutputBuffer(input, token_num, local_head_num * size_per_head);
-    torch::Tensor tiled_counter = getTiledCounter(input);
+    torch::Tensor output        = torch::empty({token_num, local_head_num * size_per_head}, options);
+    torch::Tensor tiled_counter = torch::zeros({1}, torch::TensorOptions(torch::kUInt32).device(input.device()));
     bool          use_fp8_fmha  = kv_block_array.cache_type == KvCacheDataType::FP8;
     float*        attention_output_orig_quant_scale = use_fp8_fmha ? static_scale_.data_ptr<float>() : nullptr;
 
