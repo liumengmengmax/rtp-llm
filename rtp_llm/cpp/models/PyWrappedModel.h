@@ -116,7 +116,16 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     layer_num_(params.weights.layers.size()),
     description_(params.description),
     cache_manager_(params.cache_manager),
-    enable_cuda_graph_(params.hw_kernel_config.enable_cuda_graph),
+    enable_cuda_graph_(
+        // Embedding prefill (is_prefill_cuda_graph_mode=true) + reuse-cache
+        // (cache_manager available with paged KV) is currently unsafe: capture
+        // is done with prefix=0 dummies, so the recorded TRT/FlashInfer
+        // attention path bakes in "no cached prefix"; on replay a real
+        // REUSE_CACHE hit silently ignores cached prefix KV → wrong embedding
+        // (idle-fish v3_exp 4/5 cache-hit query failure repro).
+        // Disable cuda graph in this combination until the capture/replay path
+        // can dynamically rebuild attention metadata for non-zero prefix.
+        (is_prefill_cuda_graph_mode && params.cache_manager) ? false : params.hw_kernel_config.enable_cuda_graph),
     is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode),
     use_spec_decoding_(use_spec_decoding),
     enable_device_perf_(params.profile_debug_logging_config.enable_device_perf),
