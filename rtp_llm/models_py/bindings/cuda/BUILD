@@ -175,8 +175,6 @@ cc_library(
         "//rtp_llm/models_py/bindings/common/kernels:kernels_kv_cache",
         "//rtp_llm/models_py/bindings/cuda/kernels:fast_topk",
         "//rtp_llm/models_py/bindings/cuda/kernels:gather_add_rmsnorm",
-        "//rtp_llm/models_py/bindings/cuda/kernels:idlefish_mlp_l2norm",
-        "//rtp_llm/models_py/bindings/cuda/kernels:l2norm",
         "//rtp_llm/models_py/bindings/cuda/kernels:mla_quant_kernel",
         "//rtp_llm/models_py/bindings:op_defs",
         "//rtp_llm/models_py/bindings/common:common",
