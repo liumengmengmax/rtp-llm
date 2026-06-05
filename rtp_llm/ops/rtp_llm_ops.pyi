@@ -22,8 +22,6 @@ __all__ = [
     "fused_add_rmsnorm",
     "fused_qk_rmsnorm",
     "gather_add_rmsnorm",
-    "idlefish_mlp_l2norm",
-    "l2norm",
     "write_cache_store",
     "FlashInferMlaAttnParams",
     "layernorm",
@@ -125,17 +123,6 @@ def gather_add_rmsnorm(
     Gather indexed rows, add residual, and apply RMSNorm
     """
 
-def idlefish_mlp_l2norm(
-    output: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-12,
-) -> None:
-    """
-    IdleFish embedding MLP projection fused with row-wise L2 normalization
-    """
-
 def fused_qk_rmsnorm(
     IO: torch.Tensor,
     q_gamma: torch.Tensor,
@@ -174,15 +161,6 @@ def layernorm(
 ) -> None:
     """
     LayerNorm kernel
-    """
-
-def l2norm(
-    output: torch.Tensor,
-    input: torch.Tensor,
-    eps: float = 1e-12,
-) -> None:
-    """
-    Row-wise L2 normalization kernel
     """
 
 def rmsnorm(

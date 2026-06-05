@@ -37,6 +37,12 @@ py_library(
 )
 
 py_library(
+    name = "idlefish_mlp_l2norm",
+    srcs = ["idlefish_mlp_l2norm.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "triton_kernels",
     deps = [
         ":fla",
@@ -45,6 +51,7 @@ py_library(
         ":moe",
         ":common",
         ":sparse_mla",
+        ":idlefish_mlp_l2norm",
     ],
     visibility = ["//visibility:public"]
 )

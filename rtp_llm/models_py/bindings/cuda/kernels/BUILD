@@ -125,37 +125,9 @@ cc_library(
 )
 
 cc_library(
-    name = "l2norm",
-    srcs = ["l2norm.cu"],
-    hdrs = ["l2norm.h"],
-    deps = [
-        "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
-        "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
-        ":cuda_utils_common",
-        "//rtp_llm/cpp/utils:core_utils",
-    ] + torch_deps(),
-    copts = cuda_copts(),
-    visibility = ["//visibility:public"],
-)
-
-cc_library(
     name = "gather_add_rmsnorm",
     srcs = ["gather_add_rmsnorm.cu"],
     hdrs = ["gather_add_rmsnorm.h"],
-    deps = [
-        "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
-        "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
-        ":cuda_utils_common",
-        "//rtp_llm/cpp/utils:core_utils",
-    ] + torch_deps(),
-    copts = cuda_copts(),
-    visibility = ["//visibility:public"],
-)
-
-cc_library(
-    name = "idlefish_mlp_l2norm",
-    srcs = ["idlefish_mlp_l2norm.cu"],
-    hdrs = ["idlefish_mlp_l2norm.h"],
     deps = [
         "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
         "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
@@ -186,9 +158,7 @@ cc_library(
         ":cuda_no_aux_tc",
         ":cuda_quantization",
         ":cuda_fused_qk_rmsnorm",
-        ":l2norm",
         ":gather_add_rmsnorm",
-        ":idlefish_mlp_l2norm",
         ":mla_quant_kernel",
     ],
     visibility = ["//visibility:public"],
