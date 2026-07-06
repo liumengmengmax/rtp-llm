@@ -23,7 +23,7 @@ def _get_cutlass_scaled_mm_blockwise_sm120_fp8():
         from rtp_llm.ops.compute_ops import cutlass_scaled_mm_blockwise_sm120_fp8
 
         return cutlass_scaled_mm_blockwise_sm120_fp8
-    except ImportError:
+    except (ImportError, AttributeError):
         return None
 
 
