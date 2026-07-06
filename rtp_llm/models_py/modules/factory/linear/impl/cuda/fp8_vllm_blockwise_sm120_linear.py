@@ -79,11 +79,14 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
         bias: Optional[torch.Tensor] = None,
         quant_config: object = None,
         weight_scale_2: Optional[torch.Tensor] = None,
+        activation_type: Optional[str] = None,
     ):
         super().__init__(
-            weight, weight_scales, input_scales, bias, quant_config, weight_scale_2
+            weight, weight_scales, input_scales, bias, quant_config, weight_scale_2,
+            activation_type,
         )
         self._gemm_op = _get_cutlass_scaled_mm_blockwise_sm120_fp8()
+        self.use_gelu = (activation_type == "gelu")
         if self._gemm_op is None:
             raise RuntimeError(
                 "cutlass_scaled_mm_blockwise_sm120_fp8 op is not available; "
@@ -172,5 +175,6 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             input_scales,
             self.weight_scales,
             self._bias_flat,
+            self.use_gelu,
         )
         return output
